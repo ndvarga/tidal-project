@@ -113,7 +113,16 @@
 	"Mix-Matrix: mm_* synths ready".postln;
 };
 
+// Full path so scsynth is found when sclang runs from a VS Code terminal.
+// Short (8.3) form of C:\Program Files\SuperCollider-3.12.1\scsynth.exe: a quoted
+// path breaks once device names add more quotes to the cmd.exe line.
+Server.program = "C:\\PROGRA~1\\SUPERC~1.1\\scsynth.exe";
+
 s.reboot {
+	// Without this, Windows' default (the DDJ-FLX6's outputs) is used.
+	// For the controller's master/headphone outs use "MME : Line (DDJ-FLX6)".
+	s.options.outDevice = "MME : Speakers (Realtek(R) Audio)";
+	s.options.inDevice = "MME : Microphone (Realtek(R) Audio)";
 	s.options.numBuffers = 1024 * 256;
 	s.options.memSize = 8192 * 32;
 	s.options.numWireBufs = 128;
@@ -135,7 +144,7 @@ s.reboot {
 		~mmSynths.value;
 	};
 };
-)
+);
 
 
 // ---------------------------------------------------------------------
@@ -145,7 +154,7 @@ s.reboot {
 //  Evaluate once per session (re-running MIDIClient.init can duplicate
 //  ports on Linux, so it is only initialised the first time).
 (
-~mmMidiDevice  = "";      // EDIT ME: any part of your controller's name ("" = every input)
+~mmMidiDevice  = "DDJ";      // EDIT ME: any part of your controller's name ("" = every input)
 ~mmMidiChannel = nil;     // nil = any channel, or 0-15 to listen to one channel only
 ~mmTidal = NetAddr("127.0.0.1", 6010);
 if (MIDIClient.initialized.not) { MIDIClient.init };
@@ -157,9 +166,20 @@ MIDIClient.sources.do { |src|
 		("Mix-Matrix: listening to " ++ src.device ++ " / " ++ src.name).postln;
 	};
 };
+// Same names as startup.scd: "cc<number>" and "ch<channel>cc<number>"
+// (channel counted from 1), e.g. the DDJ-FLX6 filter knob is "ch7cc25".
+// ~mmMidiPost = true prints each knob move as the name to use in cF, e.g.
+//   MIDI ch7cc25 = 0.984  (val 125)
+// Set it to false (and re-run this block) once you have found your knobs.
+~mmMidiPost = true;
 MIDIdef.cc(\mixMatrixCC, { |val, num, chan|
 	if (~mmMidiChannel.isNil or: { chan == ~mmMidiChannel }) {
-		~mmTidal.sendMsg("/ctrl", num.asString, val / 127);
+		~mmTidal.sendMsg("/ctrl", "cc" ++ num, val / 127);
+		~mmTidal.sendMsg("/ctrl", "ch" ++ (chan + 1) ++ "cc" ++ num, val / 127);
+		if (~mmMidiPost) {
+			("MIDI ch" ++ (chan + 1) ++ "cc" ++ num ++ " = "
+				++ (val / 127).round(0.001) ++ "  (val " ++ val ++ ")").postln;
+		};
 	};
 });
 )

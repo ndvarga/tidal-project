@@ -24,6 +24,10 @@
 --    Without a controller keep useMidi = False and edit the defaults in
 --    CONFIG; re-evaluate CONFIG, then the ENGINE and OUTPUT blocks.
 --
+--  Or, instead of step 3: Shift+Enter on the :runblocks line below. It
+--  evaluates every block of this file in order (sound starts at the end).
+--  Run it again after editing, or after hush to restart.
+--
 --  Behaviour
 --    - Pattern/timbre knobs switch at the next bar line, and the new song's
 --      part enters at the right point of the shared 64-bar timeline.
@@ -45,6 +49,11 @@
 --    - Index-based arpeggios became Tidal arp modes (updown, pinkyup, up).
 -- =====================================================================
 
+-- LOADER: evaluates the whole file (defined in BootTidal.hs). The blank line
+-- below matters: a GHCi command must be the first line of its block.
+
+:runblocks
+
 
 -- =====================================================================
 --  0. SETUP  --  evaluate once, block by block
@@ -57,6 +66,9 @@ import Data.IORef
 import Data.Maybe (fromMaybe)
 
 import System.IO.Unsafe (unsafePerformIO)
+
+-- Tidal's <* (structure from the left) clashes with Prelude's.
+import Prelude hiding ((<*))
 
 -- A song is 7 tracks; a track is 5 patterns and 5 timbres, one per section.
 data Track = Track { pats :: [ControlPattern], tims :: [ControlPattern] }
@@ -129,14 +141,15 @@ swell lo hi = _slow 64 (range (pure hi) (pure lo) cosine)
 useMidi :: Bool
 useMidi = False
 
--- MIDI CC numbers, as text  --  PLACEHOLDERS, EDIT ME
+-- MIDI controls, named like the bridge sends them  --  PLACEHOLDERS, EDIT ME
+-- "cc<number>" from any channel, or "ch<channel>cc<number>" for one channel.
 ccPattern, ccTimbre :: [(String, String)]
-ccPattern = [("kick", "20"), ("snare", "21"), ("hat", "22"), ("perc", "23"), ("lead", "24"), ("chords", "25"), ("bass", "26")]
-ccTimbre = [("kick", "30"), ("snare", "31"), ("hat", "32"), ("perc", "33"), ("lead", "34"), ("chords", "35"), ("bass", "36")]
+ccPattern = [("kick", "cc20"), ("snare", "cc21"), ("hat", "cc22"), ("perc", "cc23"), ("lead", "cc24"), ("chords", "cc25"), ("bass", "cc26")]
+ccTimbre = [("kick", "cc30"), ("snare", "cc31"), ("hat", "cc32"), ("perc", "cc33"), ("lead", "cc34"), ("chords", "cc35"), ("bass", "cc36")]
 ccKey, ccMode, ccBpm :: String
-ccKey = "40"
-ccMode = "41"
-ccBpm = "42"
+ccKey = "cc40"
+ccMode = "cc41"
+ccBpm = "cc42"
 -- To add a global control: add a CC here, a default below, build its
 -- pattern in ENGINE like keyPat (e.g. a master volume with knob ccMaster),
 -- and apply it to the mix in mixMatrix, e.g.  # amp (...)
@@ -1390,7 +1403,7 @@ shards = Song
       [ s "KorgM1_sd" # lvl 0.75  -- intro
       , s "KorgM1_sd:1" # coarse 3 # lvl 0.75  -- chorus
       , s "KorgM1_cp" # verb 0.7 # lvl 0.7  -- breakdown
-      , coarse (round <$> ramp "buildup" 1 16) # s "KorgM1_sd" # lvl 0.75  -- buildup
+      , coarse (fromIntegral . round <$> ramp "buildup" 1 16) # s "KorgM1_sd" # lvl 0.75  -- buildup
       , crush (drift 4 12 1) # s "KorgM1_sd:2" # lvl 0.75  -- chorus2
       ]
   , hatT = Track
@@ -1442,7 +1455,7 @@ shards = Song
       [ lpf (drift 400 2500 4) # s "mm_bell" # mtone 0.8 # mrel 0.3 # verb 0.5 # lvl 0.4  -- intro
       , crush (sway 5 12 4) # s "mm_square" # lpf 2500 # mdec 0.2 # mlev 0 # lvl 0.25  -- chorus
       , pan (sway 0.2 0.8 2) # s "mm_bell" # mtone 0.95 # matt 0.5 # mrel 1.5 # verb 0.7 # lvl 0.4  -- breakdown
-      , coarse (round <$> ramp "buildup" 1 12) # s "mm_square" # lpf 3000 # mdec 0.1 # mlev 0 # lvl 0.25  -- buildup
+      , coarse (fromIntegral . round <$> ramp "buildup" 1 12) # s "mm_square" # lpf 3000 # mdec 0.1 # mlev 0 # lvl 0.25  -- buildup
       , crush (drift 4 12 1) # s "mm_epiano" # mtone 0.8 # mrel 0.3 # mdec 0.3 # mlev 0 # lvl 0.45  -- chorus2
       ]
   , bassT = Track
@@ -1453,10 +1466,10 @@ shards = Song
       , iter 4 (n ("[0 ~ ~ 0] [~ ~ 7 ~] [~ 0 ~ 3] [~ 5 ~ ~]" |+ shRoots)) # velocity 0.85  -- chorus2
       ]
       [ s "mm_square" # lpf 500 # mdec 0.2 # mlev 0.2 # lvl 0.35  -- intro
-      , coarse (round <$> drift 1 10 2) # s "mm_square" # lpf 900 # mdec 0.15 # mlev 0.2 # lvl 0.35  -- chorus
+      , coarse (fromIntegral . round <$> drift 1 10 2) # s "mm_square" # lpf 900 # mdec 0.15 # mlev 0.2 # lvl 0.35  -- chorus
       , s "mm_sine" # matt 0.2 # mrel 1 # lvl 0.6  -- breakdown
       , crush (ramp "buildup" 12 3) # s "mm_square" # lpf 1200 # mdec 0.1 # mlev 0 # lvl 0.3  -- buildup
-      , coarse (round <$> sway 1 8 1) # s "mm_saw" # lpf 1000 # mdec 0.15 # mlev 0.2 # lvl 0.35  -- chorus2
+      , coarse (fromIntegral . round <$> sway 1 8 1) # s "mm_saw" # lpf 1000 # mdec 0.15 # mlev 0.2 # lvl 0.35  -- chorus2
       ]
   }
 
@@ -2513,6 +2526,11 @@ mixMatrix = addTails (stack (zipWith buildTrack [0 ..] trackDefs) # cps ((/ 240)
 -- =====================================================================
 --  4. OUTPUT
 -- =====================================================================
-d1 $ mixMatrix
+-- DDJ-FLX6 filter knob (MIDI channel 7, CC 25) as a low pass on the whole mix:
+-- 100 Hz - 10 kHz, open until the knob is moved. Uses SuperDirt's djf so the
+-- tracks' own lpf settings are kept (djf 0-0.5 is its low pass half).
+d1 $ mixMatrix # djf (range 0.13 0.5 $ cF 1 "ch7cc25")
 
 -- stop:   hush
+hush
+-- hi
