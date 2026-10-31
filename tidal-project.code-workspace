@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"tidalcycles.bootTidalPath": "D:/Documents/School/Fall26/INAM7000/unparty/tidal-project/BootTidal.hs",
+		"tidalcycles.ghciPath": "C:/tools/ghc-9.8.2/bin",
+		"files.associations": {
+			"*.tidal": "haskell"
+		}
+	}
+}

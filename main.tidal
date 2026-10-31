@@ -1,0 +1,21 @@
+-- main.tidal
+-- 1. Start SuperCollider and run: SuperDirt.start
+-- 2. Open this file in VS Code and press Shift+Enter on a line
+--    (or Ctrl+Enter on a multi-line block) to evaluate it.
+
+setcps (120/60/4)
+
+-- drums
+d1 $ sound "bd*2 [~ bd] sn ~"
+
+-- hats
+d2 $ sound "hh*8" # gain 0.8 # pan sine
+
+-- bass line
+d3 $ n "0 ~ 3 5 ~ 7 ~ 5" # sound "superpiano" # octave 3 # legato 0.5
+
+-- a little variation
+d1 $ every 4 (fast 2) $ sound "bd*2 [~ bd] sn ~" # room 0.3
+
+-- silence everything
+hush
