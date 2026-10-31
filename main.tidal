@@ -1,31 +1,2518 @@
--- main.tidal
--- 1. Start SuperCollider and run: SuperDirt.start
--- 2. Open this file in VS Code and press Shift+Enter on a line
---    (or Ctrl+Enter on a multi-line block) to evaluate it.
+-- =====================================================================
+--  MIX-MATRIX for TidalCycles  --  blend songs track by track, live
+-- =====================================================================
+--  Twenty songs share the same 7 tracks, key, tempo and 64-bar structure.
+--  For every track one knob picks which song supplies its PATTERN (rhythm,
+--  pitch, accents) and another picks which song supplies its TIMBRE (sound,
+--  filters, envelopes, effects, level).
+--
+--  Three files work together:
+--    fetch_mixmatrix_samples.py  downloads the samples the songs use
+--                                (drum machines, VCSL percussion and the
+--                                GitHub sample packs) to ~/mixmatrix-samples
+--    mix-matrix-superdirt.scd    SuperCollider: starts SuperDirt with those
+--                                samples, adds the mm_* synths, and forwards
+--                                MIDI knobs to Tidal
+--    mix-matrix.tidal            this file
+--
+--  Quick start
+--    1. Run:  python3 fetch_mixmatrix_samples.py   (once)
+--    2. In SuperCollider evaluate block 1 of mix-matrix-superdirt.scd
+--       (and block 2 if you use a MIDI controller).
+--    3. Here: evaluate every block from top to bottom (blocks are separated
+--       by blank lines), then the OUTPUT block at the end.
+--    Without a controller keep useMidi = False and edit the defaults in
+--    CONFIG; re-evaluate CONFIG, then the ENGINE and OUTPUT blocks.
+--
+--  Behaviour
+--    - Pattern/timbre knobs switch at the next bar line, and the new song's
+--      part enters at the right point of the shared 64-bar timeline.
+--    - Key and mode changes apply from the next note.
+--    - The BPM knob drives Tidal's tempo through the cps control; the
+--      timeline continues without jumping.
+--
+--  Differences from the Strudel version
+--    - Sounds: Strudel's General-MIDI soundfonts and oscillators don't
+--      exist in SuperDirt, so they are played by the mm_* SynthDefs in
+--      mix-matrix-superdirt.scd (e.g. gm_epiano1 -> mm_epiano, strings ->
+--      mm_pad, guitars -> mm_pluck). Drum machines, VCSL percussion and the
+--      GitHub packs are the same recordings, fetched by the Python script.
+--    - Levels: SuperDirt's gain is exponential, so `lvl x` is used in place
+--      of Strudel's gain(x) (same loudness), and velocity becomes amp.
+--    - Delays are tempo-synced (delaytime in cycles, with lock 1).
+--    - Swing amounts are halved, because Tidal's swingBy measures the delay
+--      against the whole slice where Strudel measures the half slice.
+--    - Index-based arpeggios became Tidal arp modes (updown, pinkyup, up).
+-- =====================================================================
 
-setcps (120/60/4)
 
--- drums
-d1 $ sound "bd*2 [~ bd] sn ~"
+-- =====================================================================
+--  0. SETUP  --  evaluate once, block by block
+-- =====================================================================
 
--- hats
-d2 $ sound "hh*8" # gain 0.8 # pan sine
+import qualified Data.Map.Strict as Map
 
--- bass line
-d3 $ n "0 ~ 3 5 ~ 7 ~ 5" # sound "superpiano" # octave 3 # legato 0.5
+import Data.IORef
 
--- a little variation
-d1 $ every 4 (fast 2) $ sound "bd*2 [~ bd] sn ~" # room 0.3
+import Data.Maybe (fromMaybe)
 
--- MIDI low pass filter (DDJ-FLX6 filter knob: MIDI channel 7, CC 25)
--- Sweeps cutoff 100 Hz - 10 kHz exponentially; default 1 keeps it open until moved.
-d3 $ n "0 ~ 3 5 ~ 7 ~ 5" # sound "superpiano" # octave 3 # legato 0.5
-   # lpf (rangex 100 10000 $ cF 1 "ch7cc25")
-   # resonance 1.5
+import System.IO.Unsafe (unsafePerformIO)
 
--- same filter across drums and hats
-d1 $ sound "bd*2 [~ bd] sn ~" # lpf (rangex 100 10000 $ cF 1 "ch7cc25")
-d2 $ sound "hh*8" # gain 0.8 # pan sine # lpf (rangex 100 10000 $ cF 1 "ch7cc25")
+-- A song is 7 tracks; a track is 5 patterns and 5 timbres, one per section.
+data Track = Track { pats :: [ControlPattern], tims :: [ControlPattern] }
+data Song = Song { songName :: String, kickT, snareT, hatT, percT, leadT, chordsT, bassT :: Track }
 
--- silence everything
-hush
+-- Controls of the mm_* synths (see mix-matrix-superdirt.scd), plus
+-- basepitch: the recorded pitch (MIDI number) of a sampled melodic instrument.
+matt, mdec, mlev, mrel, mpenv, mpdec, mvib, mvibd, mfmi, mfmh, mctf, mres, mfenv, mfdec, mtone, basepitch :: Pattern Double -> ControlPattern
+matt = pF "matt"
+mdec = pF "mdec"
+mlev = pF "mlev"
+mrel = pF "mrel"
+mpenv = pF "mpenv"
+mpdec = pF "mpdec"
+mvib = pF "mvib"
+mvibd = pF "mvibd"
+mfmi = pF "mfmi"
+mfmh = pF "mfmh"
+mctf = pF "mctf"
+mres = pF "mres"
+mfenv = pF "mfenv"
+mfdec = pF "mfdec"
+mtone = pF "mtone"
+basepitch = pF "basepitch"
+
+-- lvl x: linear level like Strudel's gain(x) (SuperDirt's gain is x^4).
+-- verb r: reverb amount with a matching room size.
+lvl :: Double -> ControlPattern
+lvl x = gain (pure (x ** 0.25))
+lvlP :: Pattern Double -> ControlPattern
+lvlP p = gain ((** 0.25) <$> p)
+verb :: Double -> ControlPattern
+verb r = room (pure r) # size (pure (min 0.95 (0.3 + 0.6 * r)))
+
+-- Shared timeline: 64 bars, 1 cycle = 1 bar.
+--   intro 8 | chorus 16 | breakdown 16 | buildup 8 | chorus2 16
+-- Automation helpers (continuous signals for any numeric control):
+--   ramp "buildup" a b    straight line across one whole section
+--   rampx "buildup" a b   the same, exponential (cutoffs, speed)
+--   sway lo hi bars       sine LFO, one cycle every `bars` bars
+--   drift lo hi bars      smooth random wander
+--   swell lo hi           one swell over the whole 64-bar song
+-- In a timbre, put an automated control FIRST so it is read at every note:
+--   lpf (rampx "buildup" 300 6000) # s "mm_saw"
+-- Placed after s, it is read once per bar (stepped automation).
+sectionNames :: [String]
+sectionNames = ["intro", "chorus", "breakdown", "buildup", "chorus2"]
+sectionBars, sectionStart :: [Time]
+sectionBars = [8, 16, 16, 8, 16]
+sectionStart = [0, 8, 24, 40, 48]
+secNo :: String -> Int
+secNo nm = fromMaybe (error ("Mix-Matrix: unknown section " ++ nm)) (lookup nm (zip sectionNames [0 ..]))
+ramp, rampx :: String -> Double -> Double -> Pattern Double
+ramp sec a b = rotR (sectionStart !! secNo sec) (_slow (sectionBars !! secNo sec) (range (pure a) (pure b) saw))
+rampx sec a b = rotR (sectionStart !! secNo sec) (_slow (sectionBars !! secNo sec) (rangex a b saw))
+sway, drift :: Double -> Double -> Time -> Pattern Double
+sway lo hi bars = _slow bars (range (pure lo) (pure hi) sine)
+drift lo hi bars = _slow bars (range (pure lo) (pure hi) perlin)
+swell :: Double -> Double -> Pattern Double
+swell lo hi = _slow 64 (range (pure hi) (pure lo) cosine)
+
+
+-- =====================================================================
+--  1. CONFIG
+-- =====================================================================
+
+-- True: knobs come from the MIDI bridge in mix-matrix-superdirt.scd.
+-- False: every control uses the defaults below (audition without hardware).
+-- With MIDI on, a knob also uses its default until it is first moved.
+useMidi :: Bool
+useMidi = False
+
+-- MIDI CC numbers, as text  --  PLACEHOLDERS, EDIT ME
+ccPattern, ccTimbre :: [(String, String)]
+ccPattern = [("kick", "20"), ("snare", "21"), ("hat", "22"), ("perc", "23"), ("lead", "24"), ("chords", "25"), ("bass", "26")]
+ccTimbre = [("kick", "30"), ("snare", "31"), ("hat", "32"), ("perc", "33"), ("lead", "34"), ("chords", "35"), ("bass", "36")]
+ccKey, ccMode, ccBpm :: String
+ccKey = "40"
+ccMode = "41"
+ccBpm = "42"
+-- To add a global control: add a CC here, a default below, build its
+-- pattern in ENGINE like keyPat (e.g. a master volume with knob ccMaster),
+-- and apply it to the mix in mixMatrix, e.g.  # amp (...)
+
+-- Defaults: song numbers are positions in the songs list (0 = acid).
+-- Example blend: kick pattern from song 0 with song 7's kick sound.
+defPattern, defTimbre :: [(String, Int)]
+defPattern = [("kick", 0), ("snare", 0), ("hat", 0), ("perc", 0), ("lead", 0), ("chords", 0), ("bass", 0)]
+defTimbre = [("kick", 0), ("snare", 0), ("hat", 0), ("perc", 0), ("lead", 0), ("chords", 0), ("bass", 0)]
+defKey, defBpm :: Double
+defKey = 0
+defBpm = 126
+defMode :: String
+defMode = "minor"
+
+bpmRange, keyRange :: (Double, Double)
+bpmRange = (70, 180)
+keyRange = (-6, 6)
+bpmStep :: Double
+bpmStep = 0
+-- 0 = continuous BPM; e.g. 1 or 5 snaps the BPM knob to steps
+
+-- Shared tonic, and the octave of degree 0 for each melodic track
+rootNote :: String
+rootNote = "d"
+octaves :: [(String, Int)]
+octaves = [("bass", 2), ("chords", 3), ("lead", 4)]
+modes :: [String]
+modes = ["minor", "dorian", "phrygian", "major", "mixolydian", "lydian"]
+
+-- When knob changes take effect: True = next bar line, False = next note
+quantizeSongs, quantizeKey, quantizeMode :: Bool
+quantizeSongs = True
+quantizeKey = False
+quantizeMode = False
+
+
+-- =====================================================================
+--  2. SONGS  --  plain data
+-- =====================================================================
+--  HOW TO ADD A SONG: copy a song block, rename it, edit it, and add its
+--  name to the songs list at the end of this section.
+--
+--  Each track: Track [5 patterns] [5 timbres], one per section, in the order
+--  intro, chorus, breakdown, buildup, chorus2.
+--  PATTERN = rhythm + pitch + accents
+--    drums:   velocity "1 ~ 0.7 ~"
+--    melodic: n = scale degrees (0 = tonic, 7 = octave up), plus velocity;
+--             chords are degree stacks, n "[0,2,4]". Never note names.
+--    Rhythm tools (swingBy, ply, degradeBy, euclid "(3,8)", arp) go here.
+--  TIMBRE = sound only, no rhythm: s, filters, envelopes, effects, lvl.
+--    melodic: must not set n, note or velocity.
+--    drums:   must name a sound with s; may pick a variant ("conga:12")
+--             and tune a pitched sound with note. Never velocity.
+--  Loops of 1, 2, 4 or 8 bars stay aligned with the sections.
+--  Use silence for an empty section. checkSongs (ENGINE) reports mistakes.
+
+-- ---------------------------------------------------------------------
+--  SONG 0: "acid"  --  straight acid techno: TR-909, squelchy saw bass,
+--  square-wave stabs and lead, four-on-the-floor, 16th-note drive.
+--  Progression (one chord per bar): i - VI - VII - i
+-- ---------------------------------------------------------------------
+acid :: Song
+acid = Song
+  { songName = "acid"
+  , kickT = Track
+      [ velocity "1 1 1 1"  -- intro
+      , velocity "<[1 1 1 1]!3 [1 1 1 [1 0.6]]>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 1 1 1]!4 [1*8]!2 [1*16] ~>"  -- buildup
+      , velocity "<[1 1 1 1]!7 [1 1 [1 0.7] [1 0.5]]>"  -- chorus2
+      ]
+      [ s "RolandTR909_bd" # lpf 3000 # lvl 0.9  -- intro
+      , s "RolandTR909_bd" # lvl 1  -- chorus
+      , s "RolandTR909_bd" # verb 0.4 # lvl 0.9  -- breakdown
+      , s "RolandTR909_bd" # lvl 1  -- buildup
+      , s "RolandTR909_bd" # shape 0.2 # lvl 0.95  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ 1]>"  -- breakdown
+      , velocity ("<[~ 1 ~ 1]!2 [1 1 1 1]!2 [1*8]!2 [1*16]!2>" |* (slow 8 (range 0.5 1 saw)))  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 ~ [1 0.6]]>"  -- chorus2
+      ]
+      [ s "RolandTR909_cp" # lvl 0.8  -- intro
+      , s "RolandTR909_cp" # verb 0.15 # lvl 0.85  -- chorus
+      , s "RolandTR909_cp" # verb 0.6 # lvl 0.8  -- breakdown
+      , s "RolandTR909_sd" # lvl 0.8  -- buildup
+      , s "RolandTR909_cp" # verb 0.2 # lvl 0.85  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[~ 1]*4"  -- intro
+      , velocity "[0.5 0.7 1 0.7]*4"  -- chorus
+      , velocity "<~ ~ ~ ~ [[~ 0.6]*4]!4>"  -- breakdown
+      , velocity "[0.5 0.7 1 0.7]*4"  -- buildup
+      , velocity "[0.6 0.8 1 0.8]*4"  -- chorus2
+      ]
+      [ s "RolandTR909_oh" # lvl 0.55  -- intro
+      , s "RolandTR909_hh" # lvl 0.6  -- chorus
+      , s "RolandTR909_oh" # verb 0.4 # lvl 0.45  -- breakdown
+      , hpf (slow 8 (range 200 3000 saw)) # s "RolandTR909_hh" # lvl 0.6  -- buildup
+      , s "RolandTR909_hh" # pan 0.6 # lvl 0.65  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "[~ ~ ~ 0.7] [~ ~ 0.7 ~] [~ 0.7 ~ ~] [~ ~ 0.7 ~]"  -- chorus
+      , silence  -- breakdown
+      , velocity "[~ 0.5]*8"  -- buildup
+      , velocity "[~ ~ ~ 0.7] [~ ~ 0.7 ~] [~ 0.7 ~ 0.5] [~ ~ 0.7 0.4]"  -- chorus2
+      ]
+      [ s "RolandTR909_rim" # lvl 0.6  -- intro
+      , s "RolandTR909_rim" # delay 0.25 # delaytime 0.1875 # lock 1 # delayfeedback 0.3 # lvl 0.65  -- chorus
+      , s "RolandTR909_rim" # verb 0.5 # lvl 0.5  -- breakdown
+      , s "RolandTR909_lt" # lvl 0.6  -- buildup
+      , s "RolandTR909_rim" # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # lvl 0.65  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[0 ~ ~ 0 ~ ~ 2 ~ ~ 4 ~ ~ 2 ~ ~ ~] [0 ~ ~ 0 ~ ~ 2 ~ ~ 5 ~ ~ 4 ~ 2 ~]>" # velocity "[1 0.7 0.8 0.7]*4"  -- chorus
+      , n "<[7@3 6] 4 [5@3 6] [7@2 ~ ~]>" # velocity 0.8  -- breakdown
+      , n ("[0 2 4 7]*4" |+ "<0 0 0 0 2 2 4 4>") # velocity "[1 0.6 0.8 0.6]*4"  -- buildup
+      , n "<[7 ~ ~ 7 ~ ~ 9 ~ ~ 11 ~ ~ 9 ~ ~ ~] [7 ~ ~ 7 ~ ~ 9 ~ ~ 12 ~ ~ 11 ~ 9 ~]>" # velocity "[1 0.7 0.8 0.7]*4"  -- chorus2
+      ]
+      [ s "mm_square" # lpf 1500 # mdec 0.15 # mlev 0 # lvl 0.35  -- intro
+      , s "mm_square" # lpf 1800 # resonance 0.2 # mdec 0.18 # mlev 0.1 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # lvl 0.35  -- chorus
+      , s "mm_square" # matt 0.15 # mrel 0.8 # lpf 900 # verb 0.6 # lvl 0.3  -- breakdown
+      , lpf (slow 8 (range 600 4000 saw)) # s "mm_square" # resonance 0.27 # mdec 0.12 # mlev 0 # lvl 0.32  -- buildup
+      , s "mm_square" # lpf 2600 # resonance 0.2 # mdec 0.18 # mlev 0.1 # delay 0.35 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # lvl 0.35  -- chorus2
+      ]
+  , chordsT = Track
+      [ silence  -- intro
+      , struct "[~ ~ t ~] [~ ~ ~ t] [~ ~ t ~] [~ ~ ~ ~]" (n "<[0,2,4] [-2,0,2] [-1,1,3] [0,2,4]>") # velocity 0.9  -- chorus
+      , n "<[0,2,4] [-2,0,2] [-1,1,3] [0,2,4]>" # velocity 0.8  -- breakdown
+      , struct "<[t*8]!6 [t*16]!2>" (n "<[0,2,4] [-2,0,2] [-1,1,3] [0,2,4]>") # velocity 0.8  -- buildup
+      , struct "[~ ~ t ~] [~ ~ ~ t] [~ ~ t ~] [~ t ~ ~]" (n "<[0,2,4] [-2,0,2] [-1,1,3] [0,2,4]>") # velocity 0.9  -- chorus2
+      ]
+      [ s "mm_saw" # matt 0.3 # mrel 1 # lpf 700 # verb 0.5 # lvl 0.2  -- intro
+      , s "mm_square" # lpf 2000 # mdec 0.14 # mlev 0 # verb 0.3 # lvl 0.3  -- chorus
+      , s "mm_saw" # matt 0.4 # mrel 1.2 # lpf 900 # verb 0.7 # lvl 0.2  -- breakdown
+      , lpf (slow 8 (range 500 3500 saw)) # s "mm_square" # mdec 0.1 # mlev 0 # verb 0.3 # lvl 0.28  -- buildup
+      , s "mm_square" # lpf 2400 # mdec 0.16 # mlev 0 # verb 0.35 # lvl 0.3  -- chorus2
+      ]
+  , bassT = Track
+      [ n "<~ ~ ~ ~ [0 0 7 0 0 7 0 0]!4>" # velocity "[1 0.7]*4"  -- intro
+      , n ("[0 0 7 0] [0 ~ 7 0] [0 0 ~ 3] [7 0 ~ 0]" |+ "<0 -2 -1 0>") # velocity "[1 0.6 0.8 0.6]*4"  -- chorus
+      , n ("[0 0 7 0] [0 ~ 7 0] [0 0 ~ 3] [7 0 ~ 0]" |+ "<0 -2 -1 0>") # velocity "[0.8 0.5 0.7 0.5]*4"  -- breakdown
+      , n "[0 0 7 0]*4" # velocity "[1 0.6 0.8 0.6]*4"  -- buildup
+      , n ("[0 0 7 0] [0 ~ 7 0] [0 3 ~ 3] [7 0 5 0]" |+ "<0 -2 -1 0>") # velocity "[1 0.6 0.8 0.6]*4"  -- chorus2
+      ]
+      [ s "mm_saw" # mctf 300 # mres 0.45 # mfenv 3 # mfdec 0.12 # mdec 0.15 # mlev 0 # lvl 0.5  -- intro
+      , s "mm_saw" # mctf 450 # mres 0.64 # mfenv 4 # mfdec 0.15 # mdec 0.18 # mlev 0.1 # shape 0.2 # lvl 0.45  -- chorus
+      , mctf (slow 8 (range 250 900 sine)) # s "mm_saw" # mres 0.73 # mfenv 3 # mfdec 0.15 # mdec 0.18 # mlev 0.1 # verb 0.3 # lvl 0.45  -- breakdown
+      , mctf (slow 8 (range 300 2500 saw)) # s "mm_saw" # mres 0.73 # mfenv 3 # mfdec 0.1 # mdec 0.15 # mlev 0 # shape 0.2 # lvl 0.45  -- buildup
+      , mctf (slow 4 (range 400 1400 sine)) # s "mm_saw" # mres 0.64 # mfenv 4 # mfdec 0.15 # mdec 0.18 # mlev 0.1 # shape 0.25 # lvl 0.45  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 1: "dusk"  --  laid-back half-time broken beat: TR-808, swung
+--  hats, Rhodes 7th chords, sine sub-bass, FM bell lead with delay.
+--  Progression (one chord per bar): i7 - VImaj7 - iv7 - v7
+-- ---------------------------------------------------------------------
+dusk :: Song
+dusk = Song
+  { songName = "dusk"
+  , kickT = Track
+      [ velocity "<[[1 ~ ~ ~] ~ ~ ~]!4 [[1 ~ ~ ~] ~ [~ ~ 1 ~] ~]!4>"  -- intro
+      , velocity "<[[1 ~ ~ ~] ~ [~ ~ 1 ~] ~] [[1 ~ ~ ~] [~ ~ ~ 0.6] [~ ~ 1 ~] [~ 1 ~ ~]]>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ ~ ~]!4 [1 ~ 1 ~]!2 [1 1 1 1] [1*8]>"  -- buildup
+      , velocity "<[[1 ~ ~ ~] ~ [~ ~ 1 ~] ~] [[1 ~ ~ ~] [~ ~ ~ 0.6] [~ ~ 1 ~] [~ 1 ~ ~]] [[1 ~ ~ ~] ~ [~ ~ 1 ~] [~ ~ 0.6 ~]] [[1 ~ ~ 0.5] [~ ~ ~ 0.6] [~ ~ 1 ~] [~ 1 ~ 1]]>"  -- chorus2
+      ]
+      [ s "RolandTR808_bd" # lpf 1200 # lvl 0.95  -- intro
+      , s "RolandTR808_bd" # lvl 1  -- chorus
+      , s "RolandTR808_bd" # verb 0.5 # lvl 0.9  -- breakdown
+      , s "RolandTR808_bd" # lvl 1  -- buildup
+      , s "RolandTR808_bd" # shape 0.15 # lvl 1  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ ~ ~ [~ ~ 1 ~] [~ ~ 1 ~]>"  -- intro
+      , velocity "<[~ ~ 1 ~] [[~ ~ ~ 0.3] ~ 1 [~ ~ 0.3 ~]]>"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ 1 ~]>"  -- breakdown
+      , velocity ("<[~ ~ 1 ~]!2 [~ 1 ~ 1]!2 [1 1 1 1]!2 [1*8] [1*16]>" |* (slow 8 (range 0.5 1 saw)))  -- buildup
+      , velocity "<[~ ~ 1 ~] [[~ ~ ~ 0.3] ~ 1 [~ ~ 0.3 ~]] [~ ~ 1 [~ ~ ~ 0.4]] [[~ ~ ~ 0.3] ~ 1 [~ 0.4 0.3 ~]]>"  -- chorus2
+      ]
+      [ s "RolandTR808_sd" # verb 0.4 # lvl 0.75  -- intro
+      , s "RolandTR808_sd" # verb 0.35 # lvl 0.8  -- chorus
+      , s "RolandTR808_cp" # verb 0.8 # lvl 0.7  -- breakdown
+      , s "RolandTR808_sd" # lvl 0.8  -- buildup
+      , s "RolandTR808_sd" # verb 0.35 # shape 0.1 # lvl 0.8  -- chorus2
+      ]
+  , hatT = Track
+      [ swingBy (1/6) 4 (velocity "[0.6 0.3]*4")  -- intro
+      , swingBy (1/6) 8 (velocity "[0.7 0.3 0.5 0.3]*4")  -- chorus
+      , swingBy (1/6) 4 (velocity "[0.5 0.25]*4")  -- breakdown
+      , swingBy (1/6) 8 (velocity "[0.7 0.3 0.5 0.3]*4")  -- buildup
+      , swingBy (1/6) 8 (velocity "[0.8 0.3 0.6 0.4]*4")  -- chorus2
+      ]
+      [ s "RolandTR808_hh" # lpf 5000 # lvl 0.5  -- intro
+      , s "RolandTR808_hh" # pan 0.6 # lvl 0.55  -- chorus
+      , s "RolandTR808_hh" # verb 0.5 # lvl 0.4  -- breakdown
+      , hpf (slow 8 (range 300 4000 saw)) # s "RolandTR808_hh" # lvl 0.55  -- buildup
+      , pan (slow 2 (range 0.35 0.65 sine)) # s "RolandTR808_hh" # lvl 0.55  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , swingBy (1/6) 8 (velocity "[~ ~ 0.6 ~] [~ 0.4 ~ ~] [~ ~ ~ 0.6] [~ ~ 0.5 ~]")  -- chorus
+      , velocity "<[~ ~ 0.5 ~] ~ ~ ~>"  -- breakdown
+      , swingBy (1/6) 8 (velocity "[~ ~ 0.6 ~] [~ 0.4 ~ ~] [~ ~ ~ 0.6] [~ ~ 0.5 ~]")  -- buildup
+      , swingBy (1/6) 8 (velocity "[~ ~ 0.6 ~] [~ 0.4 ~ 0.4] [~ ~ ~ 0.6] [0.4 ~ 0.5 ~]")  -- chorus2
+      ]
+      [ s "RolandTR808_rim" # lvl 0.55  -- intro
+      , s "RolandTR808_rim" # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.45 # lvl 0.55  -- chorus
+      , s "RolandTR808_rim" # delay 0.5 # delaytime 0.25 # lock 1 # delayfeedback 0.55 # verb 0.4 # lvl 0.5  -- breakdown
+      , s "RolandTR808_rim" # lvl 0.55  -- buildup
+      , s "RolandTR808_cb" # delay 0.35 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # lvl 0.4  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , swingBy (1/6) 4 (n "<[~ 4 ~ 2 ~ 4 6 ~] [~ 4 ~ 2 ~ 0 ~ ~] [~ 2 ~ 0 ~ 2 3 ~] [4 ~ ~ ~ ~ ~ ~ ~]>" # velocity "[0.8 1]*4")  -- chorus
+      , n "<[4@3 2] 0 [2@3 3] [4@2 ~ ~]>" # velocity 0.7  -- breakdown
+      , n ("[0 2 4 6]*2" |+ "<0 0 -2 -2 -4 -4 -3 -3>") # velocity "[0.6 0.8]*4"  -- buildup
+      , swingBy (1/6) 4 (n "<[~ 7 ~ 6 ~ 4 ~ ~] [~ 4 ~ 6 ~ 7 ~ ~] [~ 9 ~ 7 ~ 6 4 ~] [2 ~ 4 ~ ~ ~ ~ ~]>" # velocity "[0.8 1]*4")  -- chorus2
+      ]
+      [ s "mm_tri" # mfmi 1.5 # mfmh 3 # mdec 0.6 # mlev 0 # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # verb 0.4 # lvl 0.45  -- intro
+      , s "mm_tri" # mfmi 2 # mfmh 3 # mdec 0.5 # mlev 0 # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.45 # verb 0.4 # lvl 0.45  -- chorus
+      , s "mm_tri" # mfmi 1 # mfmh 2 # matt 0.05 # mrel 1.2 # verb 0.7 # lvl 0.4  -- breakdown
+      , mfmi (slow 8 (range 0.5 4 saw)) # s "mm_tri" # mfmh 3 # mdec 0.3 # mlev 0 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # lvl 0.4  -- buildup
+      , s "mm_sine" # mfmi 3 # mfmh 3.5 # mdec 0.6 # mlev 0 # delay 0.45 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.45 # lvl 0.45  -- chorus2
+      ]
+  , chordsT = Track
+      [ n "<[0,2,4,6] [-2,0,2,4] [-4,-2,0,2] [-3,-1,1,3]>" # velocity 0.6  -- intro
+      , struct "t@6 t@4 t@6" (n "<[0,2,4,6] [-2,0,2,4] [-4,-2,0,2] [-3,-1,1,3]>") # velocity 0.7  -- chorus
+      , n "<[0,2,4,6] [-2,0,2,4] [-4,-2,0,2] [-3,-1,1,3]>" # velocity 0.55  -- breakdown
+      , struct "<[t*4]!6 [t*8]!2>" (n "<[0,2,4,6]!2 [-2,0,2,4]!2 [-4,-2,0,2]!2 [-3,-1,1,3]!2>") # velocity 0.6  -- buildup
+      , struct "t@6 t@4 t@3 t@3" (n "<[0,2,4,6] [-2,0,2,4] [-4,-2,0,2] [-3,-1,1,3]>") # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_epiano" # mtone 0.3 # mrel 0.3 # lpf 1400 # verb 0.6 # lvl 0.6  -- intro
+      , s "mm_epiano" # mtone 0.3 # mrel 0.4 # verb 0.45 # lvl 0.65  -- chorus
+      , s "mm_epiano" # mtone 0.3 # lpf 1800 # mrel 1 # verb 0.8 # lvl 0.6  -- breakdown
+      , lpf (slow 8 (range 800 6000 saw)) # s "mm_epiano" # mtone 0.3 # mrel 0.3 # verb 0.4 # lvl 0.6  -- buildup
+      , s "mm_epiano" # mtone 0.3 # mrel 0.4 # verb 0.5 # shape 0.1 # lvl 0.65  -- chorus2
+      ]
+  , bassT = Track
+      [ n "<~ ~ ~ ~ [0@3 ~] [-2@3 ~] [-4@3 ~] [-3@3 ~]>"  -- intro
+      , n ("[[0 ~ ~ 0] ~ [~ ~ 0 ~] [~ 7 ~ ~]]" |+ "<0 -2 -4 -3>") # velocity 0.9  -- chorus
+      , n "<0 -2 -4 -3>" # velocity 0.8  -- breakdown
+      , n ("0*8" |+ "<0 0 -2 -2 -4 -4 -3 -3>") # velocity "[1 0.7]*4"  -- buildup
+      , n ("[[0 ~ ~ 0] [~ ~ 0 ~] [~ ~ 0 ~] [~ 7 ~ 4]]" |+ "<0 -2 -4 -3>") # velocity 0.9  -- chorus2
+      ]
+      [ s "mm_sine" # matt 0.02 # mrel 0.3 # lvl 0.8  -- intro
+      , s "mm_sine" # mdec 0.5 # mlev 0.6 # mrel 0.1 # shape 0.3 # lvl 0.75  -- chorus
+      , s "mm_sine" # matt 0.1 # mrel 1 # lpf 300 # lvl 0.75  -- breakdown
+      , s "mm_sine" # mdec 0.2 # mlev 0 # shape 0.4 # lvl 0.75  -- buildup
+      , s "mm_tri" # mdec 0.5 # mlev 0.6 # mrel 0.1 # lpf 600 # shape 0.3 # lvl 0.7  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 2: "glitter"  --  hyperpop: bouncy driven kicks, vocal chops,
+--  chipmunk-rising snare rolls, supersaw stabs, bubbly sample arps.
+--  Sounds: hyperpop pack from GitHub (hp_*). Sweet spot 140-160 BPM.
+--  Progression (one chord per bar): VI - VII - i - v
+-- ---------------------------------------------------------------------
+glProg :: Pattern Note
+glProg = "<[-2,0,2] [-1,1,3] [0,2,4] [-3,-1,1]>"
+glRoots :: Pattern Note
+glRoots = "<-2 -1 0 -3>"
+glitter :: Song
+glitter = Song
+  { songName = "glitter"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [1 ~ ~ ~ 1 ~ ~ ~]!4>"  -- intro
+      , velocity "<[[1 ~ ~ 1] [~ ~ 1 ~] [1 ~ ~ 1] [~ ~ 1 ~]] [[1 ~ ~ 1] [~ ~ 1 ~] [1 ~ 1 1] [~ 1 1 ~]]>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ 1 ~]!4 [1 1 1 1]!2 [1*8] [1*16]>"  -- buildup
+      , velocity "<[[1 ~ ~ 1] [~ ~ 1 ~] [1 ~ ~ 1] [~ ~ 1 ~]]!3 [[1 ~ 1 1] [~ 1 1 ~] [1 1 1 1] [1*8]]>"  -- chorus2
+      ]
+      [ s "hp_kick:0" # lvl 0.9  -- intro
+      , s "hp_kick:1" # shape 0.3 # lvl 0.85  -- chorus
+      , s "hp_kick:0" # verb 0.5 # lvl 0.8  -- breakdown
+      , s "hp_kick:1" # lvl 0.85  -- buildup
+      , s "hp_kick:2" # shape 0.35 # lvl 0.85  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ ~ ~ [~ 1 ~ 1] [~ 1 ~ [1 1]]>"  -- intro
+      , velocity "<[~ 1 ~ 1] [~ 1 ~ [1 [~ 1]]]>"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ [1 1 1 1]]>"  -- breakdown
+      , velocity ("<[~ 1 ~ 1]!2 [1 1 1 1]!2 [1*8]!2 [1*16] [1*32]>" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 [~ 1] [1 1 1]]>"  -- chorus2
+      ]
+      [ s "hp_snare:0" # lvl 0.8  -- intro
+      , s "hp_snare:0" # verb 0.2 # lvl 0.85  -- chorus
+      , s "hp_snare:1" # verb 0.6 # lvl 0.75  -- breakdown
+      , speed (rampx "buildup" 1 2) # s "hp_snare:2" # lvl 0.75  -- buildup
+      , s "hp_snare:0" # shape 0.2 # verb 0.2 # lvl 0.85  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[~ 0.5]*4"  -- intro
+      , velocity "<[[0.6 0.4 0.8 0.4]*4] [[0.6 0.4 0.8 0.4] [0.6 0.4 0.8 0.4] [0.6 0.4 0.8 0.4] [[0.6 0.6 0.6] [0.8 0.8 0.8 0.8]]]>"  -- chorus
+      , velocity "[~ 0.4]*4"  -- breakdown
+      , velocity "[0.6 0.4 0.8 0.4]*4"  -- buildup
+      , velocity "[0.6 0.4 0.8 0.4] [[0.6 0.6 0.6] 0.8] [0.6 0.4 0.8 0.4] [[0.8 0.8 0.8 0.8] [0.6 0.6 0.6]]"  -- chorus2
+      ]
+      [ s "hp_hh:0" # lvl 0.5  -- intro
+      , pan (sway 0.3 0.7 1) # s "hp_hh:0" # lvl 0.55  -- chorus
+      , s "hp_hh:1" # verb 0.5 # lvl 0.45  -- breakdown
+      , s "hp_hh:2" # lvl 0.5  -- buildup
+      , pan (sway 0.2 0.8 2) # s "hp_hh:1" # lvl 0.5  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<[~ ~ 1 ~] ~ [~ ~ 1 ~] [~ 1 ~ 1]>"  -- intro
+      , velocity "[~ ~ 1 ~] [~ 1 ~ ~] [~ ~ 1 ~] [~ 1 ~ 1]"  -- chorus
+      , velocity "<~ [~ ~ ~ 1] ~ [~ 1 ~ ~]>"  -- breakdown
+      , velocity ("[1 ~ 1 ~]*2" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "<[[~ ~ 1 ~] [~ 1 ~ ~] [~ ~ 1 ~] [~ 1 ~ 1]] [[~ ~ 1 ~] [~ 1 ~ 1] [1 1 ~ 1] [~ 1 1 1]]>"  -- chorus2
+      ]
+      [ s "hp_vox:0" # verb 0.4 # lvl 0.6  -- intro
+      , s "hp_vox:1" # delay 0.25 # delaytime 0.09375 # lock 1 # delayfeedback 0.3 # lvl 0.6  -- chorus
+      , s "hp_vox:3" # verb 0.7 # lvl 0.55  -- breakdown
+      , speed (rampx "buildup" 0.8 2) # s "hp_vox:0" # lvl 0.6  -- buildup
+      , s "hp_vox:2" # delay 0.25 # delaytime 0.09375 # lock 1 # delayfeedback 0.3 # lvl 0.6  -- chorus2
+      ]
+  , leadT = Track
+      [ n ("[7 ~ 9 ~ 11 ~ 9 ~]" |+ glRoots) # velocity 0.7  -- intro
+      , n ("[7 9 11 9]*4" |+ glRoots) # velocity "[1 0.6 0.8 0.6]*4"  -- chorus
+      , n "<[9@3 7] [8@2 7 6] [7@4] [4@2 ~ ~]>" # velocity 0.7  -- breakdown
+      , n ("[7 9 11 14]*4" |+ glRoots) # velocity ("[1 0.6 0.8 0.6]*4" |* (ramp "buildup" 0.6 1))  -- buildup
+      , n ("[14 11 9 11]*4" |+ glRoots) # velocity "[1 0.6 0.8 0.6]*4"  -- chorus2
+      ]
+      [ s "hp_bubble" # basepitch 60 # attack 0.002 # hold 0.002 # release 0.2 # verb 0.3 # lvl 0.55  -- intro
+      , s "hp_bubble" # basepitch 60 # attack 0.002 # hold 0.002 # release 0.15 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.3 # lvl 0.55  -- chorus
+      , s "hp_string" # basepitch 60 # attack 0.1 # release 0.6 # verb 0.6 # lvl 0.5  -- breakdown
+      , lpf (rampx "buildup" 800 12000) # s "hp_coin" # basepitch 72 # attack 0.002 # hold 0.002 # release 0.12 # lvl 0.5  -- buildup
+      , s "hp_coin" # basepitch 72 # attack 0.002 # hold 0.002 # release 0.15 # delay 0.35 # delaytime 0.09375 # lock 1 # delayfeedback 0.35 # lvl 0.5  -- chorus2
+      ]
+  , chordsT = Track
+      [ n glProg # velocity 0.6  -- intro
+      , struct "[t ~ ~ t] [~ ~ t ~] [~ t ~ ~] [t ~ t ~]" (n glProg) # velocity 0.8  -- chorus
+      , n glProg # velocity 0.6  -- breakdown
+      , struct "<[t*4]!4 [t*8]!2 [t*16]!2>" (n glProg) # velocity 0.7  -- buildup
+      , struct "[t ~ ~ t] [~ ~ t ~] [~ t ~ t] [t ~ t t]" (n glProg) # velocity 0.8  -- chorus2
+      ]
+      [ lpf (rampx "intro" 300 3000) # s "mm_supersaw" # matt 0.05 # mrel 0.5 # lvl 0.22  -- intro
+      , s "mm_supersaw" # lpf 5000 # mdec 0.2 # mlev 0.3 # lvl 0.25  -- chorus
+      , s "mm_supersaw" # lpf 1500 # matt 0.4 # mrel 1 # verb 0.6 # lvl 0.2  -- breakdown
+      , lpf (rampx "buildup" 500 8000) # s "mm_supersaw" # mdec 0.1 # mlev 0 # lvl 0.25  -- buildup
+      , s "mm_supersaw" # lpf 7000 # mdec 0.2 # mlev 0.3 # shape 0.2 # lvl 0.25  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("<~ ~ ~ ~ [0 ~ ~ ~ 0 ~ ~ ~]!4>" |+ glRoots)  -- intro
+      , n ("[0 ~ 0 7] [~ 0 ~ 0] [0 ~ 7 ~] [0 0 ~ 7]" |+ glRoots) # velocity 0.9  -- chorus
+      , n glRoots # velocity 0.7  -- breakdown
+      , n ("[0 0 0 0]*4" |+ glRoots) # velocity "[1 0.6 0.8 0.6]*4"  -- buildup
+      , n ("[0 ~ 0 7] [~ 0 7 0] [0 ~ 7 ~] [12 0 ~ 7]" |+ glRoots) # velocity 0.9  -- chorus2
+      ]
+      [ s "hp_bass" # basepitch 42 # legato 1 # lvl 0.75  -- intro
+      , s "hp_bass" # basepitch 42 # legato 1 # shape 0.3 # lvl 0.7  -- chorus
+      , s "mm_sine" # matt 0.05 # mrel 0.5 # lvl 0.7  -- breakdown
+      , lpf (rampx "buildup" 300 4000) # s "hp_bass" # basepitch 42 # legato 1 # attack 0.002 # hold 0.002 # release 0.15 # lvl 0.7  -- buildup
+      , s "hp_bass" # basepitch 42 # legato 1 # shape 0.4 # lvl 0.7  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 3: "twostep"  --  UK garage 2-step: skippy kicks, swung hats,
+--  retriggered top loops, FM "womp" bass, organ 9th-chord stabs.
+--  Sounds: UK garage pack from GitHub (ug_*). Sweet spot 130-136 BPM.
+--  Progression: i9 - iv9 - VII7 - IIImaj7
+-- ---------------------------------------------------------------------
+tsProg :: Pattern Note
+tsProg = "<[0,2,4,6,8] [-4,-2,0,2,4] [-1,1,3,5] [2,4,6,8]>"
+tsRoots :: Pattern Note
+tsRoots = "<0 -4 -1 2>"
+twostep :: Song
+twostep = Song
+  { songName = "twostep"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [[1 ~ ~ ~] ~ [~ ~ 1 ~] ~]!4>"  -- intro
+      , velocity "<[[1 ~ ~ ~] ~ [~ ~ 1 ~] ~] [[1 ~ ~ ~] ~ [~ ~ 1 ~] [~ 1 ~ ~]]>"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ [~ ~ 1 ~]]>"  -- breakdown
+      , velocity "<[1 ~ ~ ~]!2 [1 ~ 1 ~]!2 [1 1 1 1]!2 [[1 1] [1 1] [1 1] [1 1]] ~>"  -- buildup
+      , velocity "<[[1 ~ ~ ~] ~ [~ ~ 1 ~] ~] [[1 ~ ~ ~] ~ [~ ~ 1 ~] [~ 1 ~ ~]] [[1 ~ ~ ~] [~ ~ ~ 0.6] [~ ~ 1 ~] ~] [[1 ~ ~ 1] ~ [~ ~ 1 ~] [~ 1 ~ 1]]>"  -- chorus2
+      ]
+      [ s "ug_kick:0" # lpf 600 # lvl 0.9  -- intro
+      , s "ug_kick:0" # lvl 0.95  -- chorus
+      , s "ug_kick:2" # verb 0.4 # lvl 0.85  -- breakdown
+      , s "ug_kick:1" # lvl 0.9  -- buildup
+      , s "ug_kick:1" # lvl 0.95  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ [~ ~ ~ 1] ~ [~ 1 ~ 1]>"  -- breakdown
+      , velocity ("<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8] [1*16]>" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 ~ [1 [~ 1]]]>"  -- chorus2
+      ]
+      [ s "ug_clap:0" # verb 0.3 # lvl 0.75  -- intro
+      , s "ug_clap:0" # verb 0.2 # lvl 0.8  -- chorus
+      , s "ug_clap:1" # verb 0.7 # lvl 0.7  -- breakdown
+      , s "ug_snare:0" # lvl 0.75  -- buildup
+      , s "ug_clap:1" # verb 0.2 # lvl 0.8  -- chorus2
+      ]
+  , hatT = Track
+      [ swingBy (1/10) 8 (velocity "[0.5 0.3 0.7 0.3]*4")  -- intro
+      , swingBy (1/10) 8 (velocity "[0.6 0.3 0.8 0.3]*4")  -- chorus
+      , velocity "[~ 0.4]*4"  -- breakdown
+      , swingBy (1/10) 8 (velocity "[0.6 0.3 0.8 0.3]*4")  -- buildup
+      , swingBy (1/10) 8 (velocity "<[[0.6 0.3 0.8 0.3]*4] [[0.6 0.3 0.8 0.3]*3 [0.8 0.8 0.8 0.8]]>")  -- chorus2
+      ]
+      [ s "ug_hh:0" # lvl 0.5  -- intro
+      , s "ug_hh:1" # lvl 0.5  -- chorus
+      , s "ug_oh:0" # verb 0.4 # lvl 0.45  -- breakdown
+      , hpf (rampx "buildup" 300 6000) # s "ug_hh:2" # lvl 0.5  -- buildup
+      , pan (sway 0.35 0.65 1) # s "ug_hh:1" # lvl 0.5  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<~ ~ 1 1 1 1 1 1>"  -- intro
+      , velocity "1"  -- chorus
+      , velocity "<~ [~ ~ 1 ~] ~ [~ 1 ~ ~]>"  -- breakdown
+      , velocity "<1 ~ ~ ~ ~ ~ ~ ~>"  -- buildup
+      , velocity "<1 [1 ~ ~ ~ 1 ~ ~ ~]>"  -- chorus2
+      ]
+      [ s "ug_tops:1" # speed 0.94 # hpf 400 # lvl 0.55  -- intro
+      , s "ug_tops:0" # speed 0.94 # lvl 0.6  -- chorus
+      , s "ug_vox:0" # verb 0.6 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # lvl 0.6  -- breakdown
+      , s "ug_fx:2" # lvl 0.6  -- buildup
+      , s "ug_tops:0" # speed 0.94 # lvl 0.6  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[~ 4 ~ ~ 4 ~ 2 ~] [~ ~ 4 ~ 6 ~ 4 ~] [~ 3 ~ ~ 3 ~ 1 ~] [~ 2 ~ 4 ~ ~ ~ ~]>" # velocity 0.8  -- chorus
+      , n "<[4@3 2] [4@4] [3@3 1] [2@4]>" # velocity 0.6  -- breakdown
+      , n ("[4 ~ 4 ~]*2" |+ "<0 0 1 1 2 2 3 4>") # velocity 0.7  -- buildup
+      , n "<[~ 7 ~ ~ 7 ~ 6 ~] [~ ~ 8 ~ 9 ~ 8 ~] [~ 6 ~ ~ 5 ~ 3 ~] [~ 4 ~ 6 ~ ~ ~ ~]>" # velocity 0.8  -- chorus2
+      ]
+      [ s "mm_reed" # mtone 0.6 # mrel 0.4 # vowel "a" # lvl 0.5  -- intro
+      , s "mm_reed" # mtone 0.6 # mrel 0.4 # vowel "a" # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # verb 0.3 # lvl 0.5  -- chorus
+      , s "mm_pad" # mtone 0.2 # vowel "o" # matt 0.1 # mrel 0.8 # verb 0.6 # lvl 0.55  -- breakdown
+      , lpf (rampx "buildup" 800 8000) # s "mm_reed" # mtone 0.6 # mrel 0.4 # vowel "a" # lvl 0.5  -- buildup
+      , s "mm_reed" # mtone 0.6 # mrel 0.4 # vowel "a" # delay 0.35 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # verb 0.3 # lvl 0.5  -- chorus2
+      ]
+  , chordsT = Track
+      [ n tsProg # velocity 0.5  -- intro
+      , struct "[~ ~ t ~] [~ t ~ ~] [~ ~ ~ t] [~ ~ t ~]" (n tsProg) # velocity 0.7  -- chorus
+      , n tsProg # velocity 0.55  -- breakdown
+      , struct "<[[~ t]*4]!6 [t*8]!2>" (n tsProg) # velocity 0.6  -- buildup
+      , struct "<[[~ ~ t ~] [~ t ~ ~] [~ ~ ~ t] [~ ~ t ~]] [[~ ~ t ~] [~ t ~ t] [~ ~ ~ t] [~ t ~ ~]]>" (n tsProg) # velocity 0.7  -- chorus2
+      ]
+      [ lpf (rampx "intro" 400 4000) # s "mm_organ" # mtone 0.6 # mrel 0.4 # lvl 0.4  -- intro
+      , s "mm_organ" # mtone 0.6 # mrel 0.4 # mdec 0.25 # mlev 0.2 # verb 0.3 # lvl 0.45  -- chorus
+      , s "mm_epiano" # mtone 0.8 # mrel 0.8 # verb 0.6 # lvl 0.5  -- breakdown
+      , s "mm_organ" # mtone 0.6 # mrel 0.4 # mdec 0.15 # mlev 0 # lvl 0.45  -- buildup
+      , s "mm_organ" # mtone 0.6 # mrel 0.4 # mdec 0.25 # mlev 0.2 # verb 0.3 # shape 0.1 # lvl 0.45  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("<~ ~ ~ ~ [0 ~ ~ ~ ~ ~ ~ ~]!4>" |+ tsRoots)  -- intro
+      , n ("[0 ~ ~ 0] [~ ~ 7 ~] [~ 0 ~ ~] [4 ~ 7 ~]" |+ tsRoots) # velocity 0.9  -- chorus
+      , n tsRoots # velocity 0.7  -- breakdown
+      , n ("[0 ~ 0 ~]*2" |+ tsRoots) # velocity 0.85  -- buildup
+      , n ("[0 ~ ~ 0] [~ ~ 7 ~] [~ 0 ~ 4] [~ 7 ~ 0]" |+ tsRoots) # velocity 0.9  -- chorus2
+      ]
+      [ s "ug_womp" # basepitch 38 # legato 1 # lpf 800 # lvl 0.8  -- intro
+      , s "ug_womp" # basepitch 38 # legato 1 # lvl 0.8  -- chorus
+      , s "ug_wata" # basepitch 38 # legato 1 # release 0.4 # lvl 0.75  -- breakdown
+      , lpf (rampx "buildup" 300 3000) # s "ug_womp" # basepitch 38 # legato 1 # lvl 0.8  -- buildup
+      , s "ug_womp" # basepitch 38 # legato 1 # shape 0.2 # lvl 0.75  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 4: "amen"  --  atmospheric jungle: a sampled breakbeat stretched
+--  to one bar and re-cut by the perc pattern, jungle snare, reese bass
+--  with a wobbling filter, vibraphone and pads.
+--  Sounds: breaks125 (built-in), jungle snare from the UKG pack.
+--  Sweet spot 150-170 BPM.   Progression: i7 - i7 - VImaj7 - VImaj7
+-- ---------------------------------------------------------------------
+amProg :: Pattern Note
+amProg = "<[0,2,4,6] [0,2,4,6] [-2,0,2,4] [-2,0,2,4]>"
+amRoots :: Pattern Note
+amRoots = "<0 0 -2 -2>"
+amen :: Song
+amen = Song
+  { songName = "amen"
+  , kickT = Track
+      [ silence  -- intro
+      , velocity "<[[1 ~ ~ ~] [~ ~ 1 ~] ~ [~ 1 ~ ~]] [[1 ~ ~ ~] [~ ~ 1 ~] [~ ~ ~ 1] [~ ~ 1 ~]]>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ ~ ~]!4 [1 ~ 1 ~]!2 [1 1 1 1] [1*8]>"  -- buildup
+      , velocity "<[[1 ~ ~ ~] [~ ~ 1 ~] ~ [~ 1 ~ ~]] [[1 ~ ~ ~] [~ ~ 1 ~] [~ ~ ~ 1] [~ ~ 1 ~]] [[1 ~ ~ 1] [~ ~ 1 ~] ~ [~ 1 ~ ~]] [[1 ~ 1 ~] [~ ~ 1 ~] [1 ~ ~ 1] [~ 1 1 ~]]>"  -- chorus2
+      ]
+      [ s "RolandTR909_bd" # lpf 800 # lvl 0.9  -- intro
+      , s "RolandTR909_bd" # lpf 2000 # lvl 0.9  -- chorus
+      , s "RolandTR909_bd" # verb 0.5 # lvl 0.85  -- breakdown
+      , s "RolandTR909_bd" # lvl 0.9  -- buildup
+      , s "RolandTR909_bd" # shape 0.2 # lvl 0.9  -- chorus2
+      ]
+  , snareT = Track
+      [ silence  -- intro
+      , velocity "<[~ [1 ~ ~ 0.3] [~ ~ 0.3 ~] [1 ~ ~ ~]] [~ [1 ~ ~ 0.3] [~ 0.3 ~ ~] [1 ~ 0.4 ~]]>"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ [1 1 1 1]]>"  -- breakdown
+      , velocity ("<[~ 1 ~ 1]!2 [1 1 1 1]!2 [1*8]!2 [1*16]!2>" |* (ramp "buildup" 0.4 1))  -- buildup
+      , velocity "<[~ [1 ~ ~ 0.3] [~ ~ 0.3 ~] [1 ~ ~ ~]] [~ [1 ~ ~ 0.3] [~ 0.3 ~ 0.3] [1 ~ [0.4 0.4] ~]]>"  -- chorus2
+      ]
+      [ s "ug_snare:1" # lvl 0.75  -- intro
+      , s "ug_snare:1" # verb 0.2 # lvl 0.8  -- chorus
+      , s "ug_snare:1" # verb 0.6 # lvl 0.7  -- breakdown
+      , speed (rampx "buildup" 1 1.6) # s "ug_snare:1" # lvl 0.75  -- buildup
+      , s "ug_snare:1" # shape 0.15 # verb 0.2 # lvl 0.8  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.3]*4"  -- intro
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- chorus
+      , velocity "[~ 0.4]*4"  -- breakdown
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- buildup
+      , velocity "[0.6 0.3 0.5 0.4]*4"  -- chorus2
+      ]
+      [ s "RolandTR909_hh" # verb 0.4 # lvl 0.45  -- intro
+      , s "RolandTR909_hh" # lvl 0.45  -- chorus
+      , s "RolandTR909_oh" # verb 0.5 # lvl 0.35  -- breakdown
+      , s "RolandTR909_hh" # lvl 0.45  -- buildup
+      , pan (sway 0.3 0.7 2) # s "RolandTR909_hh" # lvl 0.45  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<~ ~ ~ ~ 1 1 1 [1 ~ ~ ~ ~ ~ 1 ~]>"  -- intro
+      , velocity "<1 1 1 [1 ~ ~ ~ ~ ~ 1 ~]>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<1 1 1 1 [1 ~ 1 ~] [1 ~ 1 ~] [1 1 1 1] [1*8]>"  -- buildup
+      , velocity "<1 [1 ~ ~ ~ ~ ~ 1 ~] 1 [1 ~ ~ 1 ~ ~ 1 ~]>"  -- chorus2
+      ]
+      [ s "breaks125" # lpf 900 # unit "c" # speed 1 # lvl 0.7  -- intro
+      , s "breaks125" # unit "c" # speed 1 # lvl 0.75  -- chorus
+      , s "breaks125" # lpf 600 # verb 0.5 # unit "c" # speed 1 # lvl 0.6  -- breakdown
+      , s "breaks125" # hpf (rampx "buildup" 60 2500) # unit "c" # speed 1 # lvl 0.75  -- buildup
+      , s "breaks125" # shape 0.2 # unit "c" # speed 1 # lvl 0.75  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[4@3 ~] [6 ~ 4 ~] [2@3 ~] [3 ~ 2 ~]>" # velocity 0.7  -- chorus
+      , n "<[7@2 6 4] [6@4] [4@2 2 1] [2@4]>" # velocity 0.6  -- breakdown
+      , n ("[0 2 4 6]*2" |+ "<0 0 2 2 4 4 6 7>") # velocity 0.6  -- buildup
+      , n "<[4@3 7] [6 ~ 4 ~] [9@3 ~] [8 ~ 7 ~]>" # velocity 0.75  -- chorus2
+      ]
+      [ s "mm_mallet" # mtone 0.4 # mrel 0.3 # lvl 0.5  -- intro
+      , s "mm_mallet" # mtone 0.4 # mrel 0.3 # delay 0.45 # delaytime 0.1875 # lock 1 # delayfeedback 0.45 # verb 0.4 # lvl 0.5  -- chorus
+      , s "mm_mallet" # mtone 0.4 # mrel 0.3 # delay 0.5 # delaytime 0.25 # lock 1 # delayfeedback 0.5 # verb 0.7 # lvl 0.5  -- breakdown
+      , s "mm_mallet" # mtone 0.4 # mrel 0.3 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.5  -- buildup
+      , s "mm_bell" # mtone 0.8 # mrel 0.3 # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.45 # verb 0.5 # lvl 0.45  -- chorus2
+      ]
+  , chordsT = Track
+      [ n amProg # velocity 0.6  -- intro
+      , n amProg # velocity 0.6  -- chorus
+      , n amProg # velocity 0.6  -- breakdown
+      , struct "<[t ~ t ~]!4 [t*4]!2 [t*8]!2>" (n amProg) # velocity 0.6  -- buildup
+      , n amProg # velocity 0.65  -- chorus2
+      ]
+      [ lpf (rampx "intro" 300 2500) # s "mm_pad" # mtone 0.3 # matt 0.5 # mrel 1.5 # lvl 0.45  -- intro
+      , s "mm_pad" # mtone 0.3 # matt 0.3 # mrel 1.5 # verb 0.5 # lvl 0.45  -- chorus
+      , pan (sway 0.3 0.7 4) # s "mm_pad" # mtone 0.4 # matt 0.6 # mrel 2 # verb 0.7 # lvl 0.45  -- breakdown
+      , lpf (rampx "buildup" 600 6000) # s "mm_pad" # mtone 0.4 # mrel 0.4 # mdec 0.2 # mlev 0.4 # lvl 0.45  -- buildup
+      , s "mm_pad" # mtone 0.6 # matt 0.3 # mrel 1.5 # verb 0.5 # lvl 0.45  -- chorus2
+      ]
+  , bassT = Track
+      [ silence  -- intro
+      , n "<[0@3 0] [0@2 -1 0] [-2@3 -2] [-2 ~ -3 -2]>" # velocity 0.9  -- chorus
+      , n amRoots # velocity 0.7  -- breakdown
+      , n ("[0 ~ 0 ~]*2" |+ amRoots) # velocity 0.85  -- buildup
+      , n "<[0@3 7] [0@2 -1 0] [-2@3 5] [-2 ~ -3 -1]>" # velocity 0.9  -- chorus2
+      ]
+      [ s "mm_saw" # lpf 400 # lvl 0.4  -- intro
+      , lpf (sway 250 900 2) # s "mm_saw" # resonance 0.13 # shape 0.3 # lvl 0.4  -- chorus
+      , s "mm_sine" # matt 0.2 # mrel 1 # lvl 0.6  -- breakdown
+      , lpf (rampx "buildup" 200 2500) # s "mm_saw" # shape 0.3 # lvl 0.4  -- buildup
+      , lpf (sway 300 1200 1) # s "mm_saw" # resonance 0.2 # shape 0.35 # lvl 0.4  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 5: "roots"  --  dub reggae: one-drop kick and rimshot on beat 3,
+--  triplet-swung hats, guitar skank, deep sine bass, melodica, and
+--  delay "throws" whose feedback is automated so echoes swell and fade.
+--  Sweet spot 75-90 BPM.   Progression: i - i - iv - iv
+-- ---------------------------------------------------------------------
+rtProg :: Pattern Note
+rtProg = "<[0,2,4] [0,2,4] [-4,-2,0] [-4,-2,0]>"
+rtRoots :: Pattern Note
+rtRoots = "<0 0 -4 -4>"
+roots :: Song
+roots = Song
+  { songName = "roots"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [~ ~ 1 ~]!4>"  -- intro
+      , velocity "~ ~ 1 ~"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ 1 ~]>"  -- breakdown
+      , velocity "<[~ ~ 1 ~]!4 [1 ~ 1 ~]!2 [1 1 1 1]!2>"  -- buildup
+      , velocity "<[~ ~ 1 ~]!3 [1 1 1 1]>"  -- chorus2
+      ]
+      [ s "AkaiMPC60_bd" # lpf 600 # lvl 0.95  -- intro
+      , s "AkaiMPC60_bd" # lpf 900 # lvl 1  -- chorus
+      , s "AkaiMPC60_bd" # verb 0.6 # lvl 0.9  -- breakdown
+      , s "AkaiMPC60_bd" # lvl 1  -- buildup
+      , s "AkaiMPC60_bd" # shape 0.2 # lvl 0.95  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ ~ 1 ~]!4>"  -- intro
+      , velocity "<[~ ~ 1 ~]!3 [~ ~ 1 [~ ~ ~ 0.5]]>"  -- chorus
+      , velocity "<~ [~ ~ 1 ~] ~ [~ ~ 1 ~]>"  -- breakdown
+      , velocity "<[~ ~ 1 ~]!4 [~ 1 ~ 1]!2 [1 1 1 1] [1*8]>"  -- buildup
+      , velocity "<[~ ~ 1 ~]!3 [~ ~ 1 [1 0.6 0.4 0.3]]>"  -- chorus2
+      ]
+      [ s "AkaiMPC60_rim" # verb 0.5 # lvl 0.7  -- intro
+      , s "AkaiMPC60_rim" # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.4 # lvl 0.7  -- chorus
+      , delayfeedback (sway 0.5 0.8 8) # s "AkaiMPC60_sd" # delay 0.6 # delaytime 0.1875 # lock 1 # verb 0.6 # lvl 0.65  -- breakdown
+      , s "AkaiMPC60_sd" # verb 0.3 # lvl 0.7  -- buildup
+      , delayfeedback (sway 0.35 0.75 4) # s "AkaiMPC60_rim" # delay 0.5 # delaytime 0.1875 # lock 1 # verb 0.4 # lvl 0.7  -- chorus2
+      ]
+  , hatT = Track
+      [ swingBy (1/6) 4 (velocity "[0.5 0.3]*4")  -- intro
+      , swingBy (1/6) 4 (velocity "[0.6 0.3]*4")  -- chorus
+      , swingBy (1/6) 4 (velocity "[~ 0.3]*4")  -- breakdown
+      , swingBy (1/6) 8 (velocity "[0.6 0.3 0.5 0.3]*4")  -- buildup
+      , swingBy (1/6) 4 (velocity "[0.6 0.3]*4")  -- chorus2
+      ]
+      [ s "AkaiMPC60_hh" # lvl 0.45  -- intro
+      , s "AkaiMPC60_hh" # lvl 0.5  -- chorus
+      , s "AkaiMPC60_oh" # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # lvl 0.35  -- breakdown
+      , s "AkaiMPC60_hh" # lvl 0.5  -- buildup
+      , pan (sway 0.3 0.7 2) # s "AkaiMPC60_hh" # lvl 0.5  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<1 ~ ~ ~ ~ ~ ~ ~>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ 1]>"  -- breakdown
+      , velocity ("[~ 1]*4" |* (ramp "buildup" 0.3 1))  -- buildup
+      , velocity "~ [1 0.5] ~ 1"  -- chorus2
+      ]
+      [ s "ug_fx:1" # delay 0.5 # delaytime 0.1875 # lock 1 # delayfeedback 0.6 # verb 0.6 # lvl 0.4  -- intro
+      , s "tambourine" # lvl 0.45  -- chorus
+      , s "ug_fx:1" # delay 0.6 # delaytime 0.25 # lock 1 # delayfeedback 0.65 # verb 0.7 # lvl 0.4  -- breakdown
+      , s "tambourine:2" # lvl 0.45  -- buildup
+      , s "tambourine" # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # lvl 0.45  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[4 ~ ~ 4 2 ~ 0 ~] [2@4 ~ ~ ~ ~] [4 ~ ~ 4 5 ~ 4 ~] [2@3 ~ 0@2 ~ ~]>" # velocity 0.7  -- chorus
+      , n "<[7@6 ~ ~] ~ [5@6 ~ ~] ~>" # velocity 0.6  -- breakdown
+      , n ("[0 2 4 2]*2" |+ "<0 0 0 0 2 2 4 4>") # velocity 0.6  -- buildup
+      , n "<[7 ~ ~ 7 6 ~ 4 ~] [6@4 ~ ~ ~ ~] [5 ~ ~ 5 4 ~ 2 ~] [4@3 ~ 2@2 ~ ~]>" # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_reed" # mtone 0.4 # mrel 0.4 # lvl 0.45  -- intro
+      , s "mm_reed" # mtone 0.4 # mrel 0.4 # delay 0.45 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.4 # lvl 0.45  -- chorus
+      , s "mm_reed" # mtone 0.4 # mrel 0.4 # delay 0.6 # delaytime 0.25 # lock 1 # delayfeedback 0.6 # verb 0.7 # lvl 0.4  -- breakdown
+      , s "mm_reed" # mtone 0.4 # mrel 0.4 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.45  -- buildup
+      , delayfeedback (sway 0.4 0.7 8) # s "mm_reed" # mtone 0.4 # mrel 0.4 # delay 0.5 # delaytime 0.1875 # lock 1 # verb 0.4 # lvl 0.45  -- chorus2
+      ]
+  , chordsT = Track
+      [ struct "~ t ~ t" (n rtProg) # velocity 0.6  -- intro
+      , struct "~ t ~ t" (n rtProg) # velocity 0.7  -- chorus
+      , struct "<~ [~ t ~ ~] ~ [~ ~ ~ t]>" (n rtProg) # velocity 0.6  -- breakdown
+      , struct "[~ t]*4" (n rtProg) # velocity 0.65  -- buildup
+      , struct "[~ t]*4" (n rtProg) # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_pluck" # mtone 0.3 # mrel 0.3 # mdec 0.12 # mlev 0 # hpf 400 # verb 0.4 # lvl 0.5  -- intro
+      , s "mm_pluck" # mtone 0.3 # mrel 0.3 # mdec 0.12 # mlev 0 # hpf 300 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # lvl 0.5  -- chorus
+      , lpf (drift 500 3000 4) # s "mm_pluck" # mtone 0.6 # mrel 0.3 # delay 0.5 # delaytime 0.1875 # lock 1 # delayfeedback 0.55 # verb 0.6 # lvl 0.45  -- breakdown
+      , s "mm_organ" # mtone 0.9 # mrel 0.4 # mdec 0.15 # mlev 0 # lvl 0.4  -- buildup
+      , s "mm_organ" # mtone 0.9 # mrel 0.4 # mdec 0.12 # mlev 0 # verb 0.3 # lvl 0.4  -- chorus2
+      ]
+  , bassT = Track
+      [ silence  -- intro
+      , n ("[0 ~ ~ 0] [~ ~ 2 ~] [4 ~ 3 ~] [2 ~ 0 ~]" |+ rtRoots) # velocity 0.9  -- chorus
+      , n ("<[0@3 ~] ~ [0@3 ~] ~>" |+ rtRoots) # velocity 0.8  -- breakdown
+      , n ("[0 ~ 0 ~]*2" |+ rtRoots) # velocity 0.85  -- buildup
+      , n ("[0 ~ ~ 0] [~ ~ 2 ~] [4 ~ 3 2] [~ 0 -1 ~]" |+ rtRoots) # velocity 0.9  -- chorus2
+      ]
+      [ s "mm_sine" # lvl 0.8  -- intro
+      , s "mm_sine" # shape 0.35 # lpf 600 # lvl 0.75  -- chorus
+      , s "mm_sine" # matt 0.05 # mrel 0.6 # verb 0.3 # lvl 0.75  -- breakdown
+      , s "mm_tri" # shape 0.3 # lpf 800 # lvl 0.7  -- buildup
+      , s "mm_sine" # shape 0.4 # lpf 700 # lvl 0.75  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 6: "mirrorball"  --  disco: LinnLM-1 four-on-the-floor, open-hat
+--  offbeats, tambourine, octave-jumping finger bass, clavinet chops,
+--  brass riffs and the obligatory rising string run in the buildup.
+--  Sweet spot 116-126 BPM.   Progression: i7 - VII7 - VImaj7 - VII7
+-- ---------------------------------------------------------------------
+mbProg :: Pattern Note
+mbProg = "<[0,2,4,6] [-1,1,3,5] [-2,0,2,4] [-1,1,3,5]>"
+mbRoots :: Pattern Note
+mbRoots = "<0 -1 -2 -1>"
+mirrorball :: Song
+mirrorball = Song
+  { songName = "mirrorball"
+  , kickT = Track
+      [ velocity "1 1 1 1"  -- intro
+      , velocity "1 1 1 1"  -- chorus
+      , velocity "<~ ~ ~ ~ ~ ~ [1 ~ ~ ~] [1 ~ 1 ~]>"  -- breakdown
+      , velocity "<[1 1 1 1]!6 [1 1 1 [1 1]] [1 1 [1 1] [1 1 1 1]]>"  -- buildup
+      , velocity "1 1 1 1"  -- chorus2
+      ]
+      [ s "LinnLM1_bd" # lpf 1500 # lvl 0.95  -- intro
+      , s "LinnLM1_bd" # lvl 1  -- chorus
+      , s "LinnLM1_bd" # verb 0.4 # lvl 0.9  -- breakdown
+      , s "LinnLM1_bd" # lvl 1  -- buildup
+      , s "LinnLM1_bd:2" # lvl 1  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ 1]>"  -- breakdown
+      , velocity ("<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8] [1*16]>" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 ~ [1 1]]>"  -- chorus2
+      ]
+      [ s "LinnLM1_cp" # verb 0.2 # lvl 0.75  -- intro
+      , s "LinnLM1_sd" # verb 0.25 # lvl 0.8  -- chorus
+      , s "LinnLM1_cp" # verb 0.6 # lvl 0.7  -- breakdown
+      , s "LinnLM1_sd" # lvl 0.8  -- buildup
+      , s "LinnLM1_cp" # verb 0.25 # lvl 0.8  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.3 0.5 0.3]*4"  -- intro
+      , velocity "[~ 1]*4"  -- chorus
+      , velocity "[0.4 0.2]*4"  -- breakdown
+      , velocity "[0.5 0.3 0.7 0.3]*4"  -- buildup
+      , velocity "[~ 1]*4"  -- chorus2
+      ]
+      [ s "LinnLM1_hh" # lvl 0.45  -- intro
+      , s "LinnLM1_oh" # lvl 0.5  -- chorus
+      , s "LinnLM1_hh" # verb 0.4 # lvl 0.4  -- breakdown
+      , hpf (rampx "buildup" 200 5000) # s "LinnLM1_hh" # lvl 0.5  -- buildup
+      , pan (sway 0.3 0.7 1) # s "LinnLM1_oh" # lvl 0.5  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "[0.4 0.6 0.4 0.8]*4"  -- chorus
+      , velocity "[~ ~ ~ 0.5]*4"  -- breakdown
+      , velocity "[0.4 0.6 0.4 0.8]*4"  -- buildup
+      , velocity "[0.4 0.6 0.4 0.8]*4"  -- chorus2
+      ]
+      [ s "LinnLM1_tb" # lvl 0.4  -- intro
+      , s "LinnLM1_tb" # lvl 0.4  -- chorus
+      , s "LinnLM1_sh" # lvl 0.4  -- breakdown
+      , s "LinnLM1_sh" # lvl 0.4  -- buildup
+      , s "LinnLM1_tb" # pan 0.65 # lvl 0.45  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[~ ~ 7 ~ 9 ~ 7 ~] [6 ~ ~ ~ ~ ~ ~ ~] [~ ~ 5 ~ 7 ~ 5 ~] [6 ~ ~ ~ 8 ~ 6 ~]>" # velocity 0.8  -- chorus
+      , n "<[7@4] [6@4] [5@4] [6@2 8@2]>" # velocity 0.6  -- breakdown
+      , n ("[0 1 2 3 4 5 6 7]*2" |+ "<0 0 0 0 0 0 7 7>") # velocity "[0.6 0.7 0.8 0.9]*4"  -- buildup
+      , n "<[~ ~ 11 ~ 9 ~ 7 ~] [8 ~ 6 ~ ~ ~ ~ ~] [~ ~ 9 ~ 7 ~ 5 ~] [6 ~ ~ ~ 8 ~ 10 ~]>" # velocity 0.8  -- chorus2
+      ]
+      [ s "mm_brass" # mtone 0.6 # mrel 0.4 # lvl 0.4  -- intro
+      , s "mm_brass" # mtone 0.6 # mrel 0.4 # verb 0.3 # lvl 0.45  -- chorus
+      , s "mm_pad" # mtone 0.4 # matt 0.3 # mrel 1 # verb 0.5 # lvl 0.45  -- breakdown
+      , s "mm_pad" # mtone 0.4 # mrel 0.4 # mdec 0.1 # mlev 0.5 # lvl 0.45  -- buildup
+      , s "mm_brass" # mtone 0.6 # mrel 0.4 # verb 0.35 # lvl 0.45  -- chorus2
+      ]
+  , chordsT = Track
+      [ n mbProg # velocity 0.55  -- intro
+      , struct "[~ t ~ ~] [~ t ~ t] [~ t ~ ~] [~ t ~ ~]" (n mbProg) # velocity 0.7  -- chorus
+      , n mbProg # velocity 0.55  -- breakdown
+      , struct "[~ t]*4" (n mbProg) # velocity 0.65  -- buildup
+      , struct "[~ t ~ t] [~ t ~ ~] [~ t ~ t] [~ t t ~]" (n mbProg) # velocity 0.7  -- chorus2
+      ]
+      [ lpf (rampx "intro" 500 5000) # s "mm_pad" # mtone 0.4 # matt 0.3 # mrel 0.8 # lvl 0.4  -- intro
+      , s "mm_pluck" # mtone 0.95 # mrel 0.3 # mdec 0.15 # mlev 0.1 # lvl 0.45  -- chorus
+      , s "mm_pad" # mtone 0.4 # matt 0.5 # mrel 1.5 # verb 0.6 # lvl 0.4  -- breakdown
+      , s "mm_pluck" # mtone 0.95 # mrel 0.3 # mdec 0.1 # mlev 0 # lvl 0.45  -- buildup
+      , s "mm_epiano" # mtone 0.8 # mrel 0.3 # mdec 0.3 # mlev 0.2 # verb 0.3 # lvl 0.5  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("[0 7]*4" |+ mbRoots) # velocity "[0.9 0.7]*4"  -- intro
+      , n ("[0 7]*4" |+ mbRoots) # velocity "[1 0.7]*4"  -- chorus
+      , n "<[0@3 ~] [-1@3 ~] [-2@3 ~] [-1@2 ~ ~]>" # velocity 0.7  -- breakdown
+      , n ("[0 7]*4" |+ mbRoots) # velocity "[1 0.7]*4"  -- buildup
+      , n ("[0 7 0 7] [0 7 5 7] [0 7 0 7] [0 7 9 7]" |+ mbRoots) # velocity "[1 0.7]*8"  -- chorus2
+      ]
+      [ s "mm_bass" # mtone 0.4 # mrel 0.3 # lpf 1200 # lvl 0.7  -- intro
+      , s "mm_bass" # mtone 0.4 # mrel 0.3 # lvl 0.7  -- chorus
+      , s "mm_bass" # mtone 0.2 # mrel 0.3 # lvl 0.7  -- breakdown
+      , s "mm_bass" # mtone 0.4 # mrel 0.3 # lvl 0.7  -- buildup
+      , s "mm_bass" # mtone 0.9 # mrel 0.3 # lvl 0.65  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 7: "rotterdam"  --  gabber/hardcore: a TR-909 kick driven into
+--  heavy distortion, offbeat rumble bass, orchestra-hit stabs, a vibrato
+--  "hoover" lead and the classic "are you ready" vocal (Dirt-Samples).
+--  Sweet spot 160-180 BPM.   Progression: i - i - VI - v
+-- ---------------------------------------------------------------------
+rdProg :: Pattern Note
+rdProg = "<[0,2,4] [0,2,4] [-2,0,2] [-3,-1,1]>"
+rdRoots :: Pattern Note
+rdRoots = "<0 0 -2 -3>"
+rotterdam :: Song
+rotterdam = Song
+  { songName = "rotterdam"
+  , kickT = Track
+      [ velocity "1 1 1 1"  -- intro
+      , velocity "<[1 1 1 1]!3 [1 1 1 [1 1]]>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 1 1 1]!4 [1*8]!2 [1*16] [1*32]>"  -- buildup
+      , velocity "<[1 1 1 1]!3 [1 1 [1 1] [1 1 1]]>"  -- chorus2
+      ]
+      [ lpf (rampx "intro" 200 5000) # s "RolandTR909_bd" # shape 0.8 # lvl 0.6  -- intro
+      , s "RolandTR909_bd" # shape 0.85 # lpf 5000 # lvl 0.6  -- chorus
+      , s "RolandTR909_bd" # shape 0.6 # verb 0.6 # lvl 0.6  -- breakdown
+      , s "RolandTR909_bd" # shape 0.9 # lvl 0.55  -- buildup
+      , s "RolandTR909_bd" # shape 0.9 # crush 8 # lvl 0.55  -- chorus2
+      ]
+  , snareT = Track
+      [ silence  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ 1]>"  -- breakdown
+      , velocity "<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8] [1*16]>"  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 [1 1] [1 1 1 1]]>"  -- chorus2
+      ]
+      [ s "RolandTR909_cp" # lvl 0.7  -- intro
+      , s "RolandTR909_cp" # shape 0.3 # lvl 0.7  -- chorus
+      , s "RolandTR909_cp" # verb 0.7 # lvl 0.65  -- breakdown
+      , s "RolandTR909_sd" # shape 0.4 # lvl 0.65  -- buildup
+      , s "RolandTR909_cp" # shape 0.4 # verb 0.2 # lvl 0.7  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[~ 1]*4"  -- intro
+      , velocity "[~ 1]*4"  -- chorus
+      , velocity "[~ 0.5]*4"  -- breakdown
+      , velocity "[0.6 1]*8"  -- buildup
+      , velocity "[0.4 1 0.4 1]*4"  -- chorus2
+      ]
+      [ s "RolandTR909_oh" # legato 0.5 # lvl 0.45  -- intro
+      , s "RolandTR909_oh" # legato 0.5 # lvl 0.5  -- chorus
+      , s "RolandTR909_oh" # verb 0.5 # lvl 0.4  -- breakdown
+      , hpf (rampx "buildup" 500 8000) # s "RolandTR909_hh" # lvl 0.5  -- buildup
+      , s "RolandTR909_hh" # shape 0.3 # lvl 0.5  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<~ ~ ~ ~ ~ ~ ~ 1>"  -- intro
+      , velocity "[~ ~ ~ 1] [~ ~ 1 ~] [~ ~ ~ 1] [~ 1 ~ ~]"  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity "<~ ~ ~ ~ ~ ~ 1 ~>"  -- buildup
+      , velocity "[~ ~ ~ 1] [~ ~ 1 ~] [~ 1 ~ 1] [~ 1 1 ~]"  -- chorus2
+      ]
+      [ s "ds_rave" # verb 0.4 # lvl 0.6  -- intro
+      , s "RolandTR909_ht" # shape 0.5 # lvl 0.55  -- chorus
+      , s "ds_rave" # delay 0.5 # delaytime 0.1875 # lock 1 # delayfeedback 0.55 # verb 0.7 # lvl 0.55  -- breakdown
+      , s "ds_rave" # lvl 0.65  -- buildup
+      , s "RolandTR909_mt" # shape 0.5 # lvl 0.55  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[0 ~ 0 ~ 0 ~ 3 2] [0 ~ ~ ~ -1 ~ 0 ~] [-2 ~ -2 ~ -2 ~ 0 -1] [-3 ~ ~ ~ -1 ~ ~ ~]>" # velocity 0.9  -- chorus
+      , n "<[7@8] [5@4 4@4] [5@8] [4@4 ~ ~ ~ ~]>" # velocity 0.7  -- breakdown
+      , n ("[0 0 0 0]*4" |+ "<0 0 0 0 2 2 4 7>") # velocity "[1 0.6]*8"  -- buildup
+      , n "<[7 ~ 7 ~ 7 ~ 10 9] [7 ~ ~ ~ 6 ~ 7 ~] [5 ~ 5 ~ 5 ~ 7 6] [4 ~ ~ ~ 6 ~ ~ ~]>" # velocity 0.9  -- chorus2
+      ]
+      [ s "mm_supersaw" # lpf 2000 # lvl 0.25  -- intro
+      , s "mm_saw" # mvib 5 # mvibd 0.3 # lpf 2500 # shape 0.4 # lvl 0.28  -- chorus
+      , s "mm_pad" # mtone 0.3 # vowel "a" # matt 0.3 # mrel 1.5 # verb 0.7 # lvl 0.5  -- breakdown
+      , lpf (rampx "buildup" 500 9000) # s "mm_supersaw" # shape 0.3 # lvl 0.25  -- buildup
+      , s "mm_supersaw" # mvib 6 # mvibd 0.5 # lpf 4000 # shape 0.5 # lvl 0.25  -- chorus2
+      ]
+  , chordsT = Track
+      [ silence  -- intro
+      , struct "<[t ~ ~ ~] [t ~ ~ ~] [t ~ ~ ~] [t ~ t ~]>" (n rdProg) # velocity 0.8  -- chorus
+      , n rdProg # velocity 0.6  -- breakdown
+      , struct "<[t ~ t ~]!4 [t t t t]!2 [t*8]!2>" (n rdProg) # velocity 0.7  -- buildup
+      , struct "[t ~ ~ t] [~ ~ t ~] [t ~ ~ ~] [~ ~ t ~]" (n rdProg) # velocity 0.8  -- chorus2
+      ]
+      [ s "mm_brass" # mtone 1 # mrel 0.4 # mdec 0.35 # mlev 0 # lvl 0.45  -- intro
+      , s "mm_brass" # mtone 1 # mrel 0.4 # mdec 0.35 # mlev 0 # verb 0.4 # lvl 0.5  -- chorus
+      , s "mm_pad" # mtone 0.35 # matt 0.4 # mrel 1.5 # verb 0.6 # lvl 0.45  -- breakdown
+      , s "mm_brass" # mtone 1 # mrel 0.4 # mdec 0.35 # mlev 0 # lvl 0.5  -- buildup
+      , s "mm_brass" # mtone 1 # mrel 0.4 # mdec 0.35 # mlev 0 # shape 0.2 # verb 0.4 # lvl 0.5  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("<~ ~ ~ ~ [[~ 0]*4]!4>" |+ rdRoots)  -- intro
+      , n ("[~ 0 0 0]*4" |+ rdRoots) # velocity "[1 1 0.6 0.8]*4"  -- chorus
+      , n rdRoots # velocity 0.6  -- breakdown
+      , n ("[0 0 0 0]*4" |+ rdRoots) # velocity "[1 0.6 0.8 0.6]*4"  -- buildup
+      , n ("[~ 0 0 0]*4" |+ rdRoots) # velocity "[1 1 0.6 0.8]*4"  -- chorus2
+      ]
+      [ s "mm_sine" # shape 0.6 # lpf 300 # mdec 0.1 # mlev 0 # lvl 0.5  -- intro
+      , s "mm_sine" # shape 0.7 # lpf 400 # mdec 0.1 # mlev 0 # lvl 0.5  -- chorus
+      , s "mm_sine" # matt 0.2 # mrel 1 # lvl 0.6  -- breakdown
+      , lpf (rampx "buildup" 150 900) # s "mm_saw" # shape 0.5 # mdec 0.08 # mlev 0 # lvl 0.35  -- buildup
+      , s "mm_sine" # shape 0.75 # lpf 450 # mdec 0.1 # mlev 0 # lvl 0.5  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 8: "tundra"  --  ambient / automation study: almost no beat.
+--  Field recordings, ocean drum and cymbal swells, a shakuhachi drifting
+--  through long echoes, and pads whose filter, pan and level are all
+--  automated (random drift, slow LFOs, and one arc over the whole song).
+--  Any tempo works; it floats best at 80-100 BPM.
+--  Progression (two bars per chord): open i - VI - iv - v voicings
+-- ---------------------------------------------------------------------
+tuProg :: Pattern Note
+tuProg = "<[0,4,7,8]!2 [-2,2,5,7]!2 [-4,0,3,7]!2 [-3,1,4,6]!2>"
+tuRoots :: Pattern Note
+tuRoots = "<0!2 -2!2 -4!2 -3!2>"
+tundra :: Song
+tundra = Song
+  { songName = "tundra"
+  , kickT = Track
+      [ silence  -- intro
+      , velocity "<1 ~>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<1 ~ 1 ~ [1 ~ 1 ~] [1 ~ 1 ~] [1 1 1 1] [1 1 1 1]>"  -- buildup
+      , velocity "<1 [~ ~ 0.7 ~]>"  -- chorus2
+      ]
+      [ s "bassdrum2" # lpf 300 # verb 0.8 # lvl 0.8  -- intro
+      , s "bassdrum2" # lpf 400 # verb 0.7 # lvl 0.8  -- chorus
+      , s "timpani" # verb 0.8 # lvl 0.7  -- breakdown
+      , lpf (rampx "buildup" 200 1200) # s "bassdrum2" # verb 0.6 # lvl 0.8  -- buildup
+      , s "timpani:3" # verb 0.7 # lvl 0.7  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<1 ~ ~ ~>"  -- intro
+      , velocity "<~ ~ 1 ~>"  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity "<~ ~ ~ ~ ~ ~ 1 ~>"  -- buildup
+      , velocity "<~ ~ 1 ~>"  -- chorus2
+      ]
+      [ s "oceandrum" # verb 0.7 # lvl 0.5  -- intro
+      , s "sus_cymbal" # verb 0.6 # lvl 0.35  -- chorus
+      , pan (sway 0.2 0.8 4) # s "oceandrum:1" # verb 0.8 # lvl 0.5  -- breakdown
+      , s "timpani_roll" # verb 0.5 # lvl 0.5  -- buildup
+      , s "sus_cymbal2" # verb 0.6 # lvl 0.35  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "<[~ ~ 0.5 ~] ~ [~ 0.3 ~ ~] ~>"  -- intro
+      , velocity "[~ ~ 0.5 ~] [~ 0.3 ~ ~] [~ ~ ~ 0.4] [0.3 ~ ~ ~]"  -- chorus
+      , velocity "<[~ ~ 0.4 ~] ~ ~ ~>"  -- breakdown
+      , velocity ("[~ 0.4]*4" |* (ramp "buildup" 0.2 0.8))  -- buildup
+      , degradeBy 0.3 (velocity "[~ ~ 0.5 ~] [~ 0.3 ~ 0.3] [~ ~ ~ 0.4] [0.3 ~ 0.4 ~]")  -- chorus2
+      ]
+      [ pan (drift 0.1 0.9 2) # s "marktrees" # verb 0.6 # lvl 0.4  -- intro
+      , pan (drift 0.1 0.9 2) # s "triangles" # verb 0.5 # lvl 0.35  -- chorus
+      , s "belltree" # verb 0.8 # lvl 0.35  -- breakdown
+      , s "triangles:5" # lvl 0.35  -- buildup
+      , pan (drift 0.1 0.9 1) # s "fingercymbal" # verb 0.6 # lvl 0.35  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<1 ~ ~ ~>"  -- intro
+      , velocity "<1 ~ ~ ~ ~ ~ 1 ~>"  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity "<1 ~ ~ ~ ~ ~ ~ ~>"  -- buildup
+      , velocity "<1 ~ ~ ~ ~ ~ 1 ~>"  -- chorus2
+      ]
+      [ s "wind" # verb 0.5 # lvl 0.45  -- intro
+      , s "insect" # pan 0.3 # verb 0.5 # lvl 0.4  -- chorus
+      , s "crow" # pan 0.7 # delay 0.4 # delaytime 0.3125 # lock 1 # delayfeedback 0.4 # verb 0.7 # lvl 0.4  -- breakdown
+      , s "space" # verb 0.6 # lvl 0.4  -- buildup
+      , s "wineglass_slow" # verb 0.7 # lvl 0.4  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[4@3 ~] ~ [7@2 6 ~] ~ [8@3 ~] ~ [4@4] ~>" # velocity 0.6  -- chorus
+      , n "<[7@6 ~ ~] ~ ~ ~ [6@6 ~ ~] ~ ~ ~>" # velocity 0.5  -- breakdown
+      , n "<[0 ~ 2 ~ 4 ~ 7 ~]!4 [0 2 4 7 4 2 0 ~]!4>" # velocity 0.5  -- buildup
+      , n "<[8@3 ~] ~ [9@2 7 ~] ~ [11@3 ~] ~ [7@4] ~>" # velocity 0.6  -- chorus2
+      ]
+      [ s "mm_flute" # mtone 0.9 # mrel 0.4 # lvl 0.45  -- intro
+      , s "mm_flute" # mtone 0.9 # mrel 0.4 # delay 0.5 # delaytime 0.375 # lock 1 # delayfeedback 0.55 # verb 0.8 # lvl 0.45  -- chorus
+      , s "mm_flute" # mtone 0.1 # mrel 0.4 # delay 0.5 # delaytime 0.375 # lock 1 # delayfeedback 0.6 # verb 0.9 # lvl 0.4  -- breakdown
+      , s "mm_mallet" # mtone 0.6 # mrel 0.3 # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.6 # lvl 0.5  -- buildup
+      , delayfeedback (sway 0.4 0.75 8) # s "mm_flute" # mtone 0.9 # mrel 0.4 # delay 0.5 # delaytime 0.375 # lock 1 # verb 0.8 # lvl 0.45  -- chorus2
+      ]
+  , chordsT = Track
+      [ n tuProg # velocity 0.6  -- intro
+      , n tuProg # velocity 0.6  -- chorus
+      , n tuProg # velocity 0.55  -- breakdown
+      , struct "<t t t t [t t] [t t] [t t t t] [t t t t]>" (n tuProg) # velocity 0.55  -- buildup
+      , n tuProg # velocity 0.6  -- chorus2
+      ]
+      [ lpf (rampx "intro" 300 2500) # pan (sway 0.3 0.7 8) # s "mm_pad" # mtone 0.6 # matt 1.5 # mrel 3 # verb 0.8 # lvl 0.4  -- intro
+      , lpf (drift 800 4000 4) # pan (sway 0.25 0.75 8) # s "mm_pad" # mtone 0.5 # matt 1 # mrel 3 # verb 0.8 # lvl 0.4  -- chorus
+      , lpf (drift 400 1500 8) # s "mm_pad" # mtone 0.2 # matt 2 # mrel 4 # verb 0.9 # lvl 0.45  -- breakdown
+      , lpf (rampx "buildup" 600 7000) # s "mm_pad" # mtone 0.7 # matt 0.3 # mrel 1.5 # verb 0.6 # lvl 0.4  -- buildup
+      , lpf (drift 1000 5000 4) # pan (sway 0.2 0.8 4) # s "mm_pad" # mtone 0.6 # matt 1 # mrel 3 # verb 0.85 # lvl 0.4  -- chorus2
+      ]
+  , bassT = Track
+      [ n tuRoots # velocity 0.6  -- intro
+      , n tuRoots # velocity 0.7  -- chorus
+      , n tuRoots # velocity 0.6  -- breakdown
+      , n ("[0 ~ 0 ~]" |+ tuRoots) # velocity 0.7  -- buildup
+      , n tuRoots # velocity 0.7  -- chorus2
+      ]
+      [ lvlP (swell 0.3 0.8) # s "mm_sine" # matt 1 # mrel 2  -- intro
+      , lvlP (swell 0.3 0.8) # s "mm_sine" # matt 0.5 # mrel 2 # shape 0.2  -- chorus
+      , s "mm_bowed" # mtone 0.2 # matt 0.5 # mrel 2 # verb 0.6 # lvl 0.5  -- breakdown
+      , lpf (rampx "buildup" 200 1200) # s "mm_tri" # matt 0.1 # mrel 0.8 # lvl 0.6  -- buildup
+      , lvlP (swell 0.3 0.8) # s "mm_sine" # matt 0.5 # mrel 2 # shape 0.25  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 9: "glacier"  --  dark trap: half-time 808s, a pitch-dropping
+--  808 sub, triplet and sextuplet hi-hat rolls, music-box melody and a
+--  choir pad.   Sweet spot 130-150 BPM (felt at half time).
+--  Progression: i - i - VI - VII
+-- ---------------------------------------------------------------------
+gcProg :: Pattern Note
+gcProg = "<[0,2,4] [0,2,4] [-2,0,2] [-1,1,3]>"
+gcRoots :: Pattern Note
+gcRoots = "<0 0 -2 -1>"
+glacier :: Song
+glacier = Song
+  { songName = "glacier"
+  , kickT = Track
+      [ silence  -- intro
+      , velocity "<[[1 ~ ~ ~] [~ ~ 1 ~] ~ ~] [[1 ~ ~ ~] ~ [~ ~ 1 ~] [~ 1 ~ ~]]>"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ ~ ~]!4 [1 ~ 1 ~]!2 [1 1 1 1] ~>"  -- buildup
+      , velocity "<[[1 ~ ~ ~] [~ ~ 1 ~] ~ ~] [[1 ~ ~ ~] ~ [~ ~ 1 ~] [~ 1 ~ ~]] [[1 ~ ~ 1] [~ ~ 1 ~] ~ ~] [[1 ~ ~ ~] ~ [1 ~ 1 ~] [~ 1 ~ 1]]>"  -- chorus2
+      ]
+      [ s "RolandTR808_bd" # lvl 0.9  -- intro
+      , s "RolandTR808_bd" # shape 0.2 # lvl 0.95  -- chorus
+      , s "RolandTR808_bd" # verb 0.5 # lvl 0.85  -- breakdown
+      , s "RolandTR808_bd" # lvl 0.95  -- buildup
+      , s "RolandTR808_bd" # shape 0.3 # lvl 0.95  -- chorus2
+      ]
+  , snareT = Track
+      [ silence  -- intro
+      , velocity "<[~ ~ 1 ~] [~ ~ 1 [~ ~ ~ 0.5]]>"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ 1 ~]>"  -- breakdown
+      , velocity "<[~ ~ 1 ~]!4 [~ 1 ~ 1]!2 [1 1 1 1] [1*8]>"  -- buildup
+      , velocity "<[~ ~ 1 ~]!3 [~ ~ 1 [1 1 1]]>"  -- chorus2
+      ]
+      [ s "RolandTR808_cp" # verb 0.3 # lvl 0.8  -- intro
+      , s "RolandTR808_cp" # verb 0.3 # lvl 0.85  -- chorus
+      , s "RolandTR808_cp" # verb 0.8 # lvl 0.75  -- breakdown
+      , s "RolandTR808_sd" # lvl 0.8  -- buildup
+      , s "RolandTR808_sd" # verb 0.3 # shape 0.2 # lvl 0.85  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.3]*4"  -- intro
+      , velocity "<[[0.6 0.4]*4] [[0.6 0.4] [0.6 0.4] [0.6 0.6 0.6] [0.5 0.5 0.5 0.5 0.5 0.5]]>"  -- chorus
+      , velocity "[0.4 ~]*4"  -- breakdown
+      , velocity "<[[0.6 0.4]*4]!4 [[0.6 0.4 0.6 0.4]*4]!2 [[0.6 0.6 0.6]*4] [0.6*32]>"  -- buildup
+      , velocity "<[[0.6 0.4] [0.6 0.6 0.6] [0.6 0.4] [0.5 0.5 0.5 0.5 0.5 0.5]] [[0.6 0.4]*2 [0.6 0.6 0.6 0.6 0.6 0.6] [0.7 0.7 0.7 0.7 0.7 0.7 0.7 0.7]]>"  -- chorus2
+      ]
+      [ s "RolandTR808_hh" # lvl 0.4  -- intro
+      , s "RolandTR808_hh" # lvl 0.45  -- chorus
+      , s "RolandTR808_hh" # verb 0.6 # lvl 0.35  -- breakdown
+      , hpf (rampx "buildup" 300 6000) # s "RolandTR808_hh" # lvl 0.45  -- buildup
+      , pan (drift 0.3 0.7 1) # s "RolandTR808_hh" # lvl 0.45  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<~ ~ [~ ~ ~ 1] ~>"  -- intro
+      , velocity "[~ ~ ~ ~] [~ ~ ~ 1] [~ ~ ~ ~] [~ 1 ~ ~]"  -- chorus
+      , silence  -- breakdown
+      , velocity ("[~ 1]*4" |* (ramp "buildup" 0.3 0.8))  -- buildup
+      , velocity "[~ ~ ~ ~] [~ ~ ~ 1] [~ ~ 1 ~] [~ 1 ~ ~]"  -- chorus2
+      ]
+      [ s "RolandTR808_cb" # verb 0.6 # lvl 0.4  -- intro
+      , s "RolandTR808_rim" # lvl 0.5  -- chorus
+      , s "RolandTR808_rim" # verb 0.6 # lvl 0.45  -- breakdown
+      , s "RolandTR808_rim" # lvl 0.5  -- buildup
+      , s "RolandTR808_cb" # delay 0.3 # delaytime 0.25 # lock 1 # delayfeedback 0.4 # lvl 0.4  -- chorus2
+      ]
+  , leadT = Track
+      [ n "<[7 ~ 6 ~ 4 ~ 2 ~] [4 ~ ~ 2 ~ 1 0 ~] [2 ~ 4 ~ 5 ~ 4 ~] [3 ~ 2 ~ 1 ~ ~ ~]>" # velocity 0.6  -- intro
+      , n "<[7 ~ 6 ~ 4 ~ 2 ~] [4 ~ ~ 2 ~ 1 0 ~] [2 ~ 4 ~ 5 ~ 4 ~] [3 ~ 2 ~ 1 ~ ~ ~]>" # velocity 0.7  -- chorus
+      , n "<[7@4] [4@4] [5@4] [3@2 1@2]>" # velocity 0.5  -- breakdown
+      , n ("[7 6 4 2]*2" |+ "<0 0 0 0 2 2 4 4>") # velocity 0.6  -- buildup
+      , n "<[14 ~ 13 ~ 11 ~ 9 ~] [11 ~ ~ 9 ~ 8 7 ~] [9 ~ 11 ~ 12 ~ 11 ~] [10 ~ 9 ~ 8 ~ ~ ~]>" # velocity 0.65  -- chorus2
+      ]
+      [ s "mm_bell" # mtone 0.5 # mrel 0.3 # verb 0.6 # lvl 0.55  -- intro
+      , s "mm_bell" # mtone 0.5 # mrel 0.3 # delay 0.35 # delaytime 0.25 # lock 1 # delayfeedback 0.4 # verb 0.5 # lvl 0.55  -- chorus
+      , s "mm_bell" # mtone 0.1 # mrel 0.3 # verb 0.8 # lvl 0.5  -- breakdown
+      , lpf (rampx "buildup" 1000 10000) # s "mm_bell" # mtone 0.5 # mrel 0.3 # lvl 0.55  -- buildup
+      , s "mm_bell" # mtone 0.1 # mrel 0.3 # delay 0.35 # delaytime 0.25 # lock 1 # delayfeedback 0.4 # verb 0.5 # lvl 0.5  -- chorus2
+      ]
+  , chordsT = Track
+      [ n gcProg # velocity 0.5  -- intro
+      , n gcProg # velocity 0.55  -- chorus
+      , n gcProg # velocity 0.5  -- breakdown
+      , struct "<t!4 [t t]!2 [t*4]!2>" (n gcProg) # velocity 0.5  -- buildup
+      , n gcProg # velocity 0.55  -- chorus2
+      ]
+      [ lpf (rampx "intro" 400 3000) # s "mm_pad" # mtone 0.3 # vowel "a" # matt 0.5 # mrel 1.5 # verb 0.7 # lvl 0.45  -- intro
+      , s "mm_pad" # mtone 0.3 # vowel "a" # matt 0.3 # mrel 1.5 # verb 0.6 # lvl 0.45  -- chorus
+      , s "mm_pad" # mtone 0.35 # matt 0.6 # mrel 2 # verb 0.7 # lvl 0.45  -- breakdown
+      , s "mm_pad" # mtone 0.5 # vowel "e" # matt 0.05 # mrel 0.5 # lvl 0.45  -- buildup
+      , pan (sway 0.3 0.7 4) # s "mm_pad" # mtone 0.3 # vowel "a" # matt 0.3 # mrel 1.5 # verb 0.6 # lvl 0.45  -- chorus2
+      ]
+  , bassT = Track
+      [ silence  -- intro
+      , n ("<[[0 ~ ~ ~] [~ ~ 0 ~] ~ ~] [[0 ~ ~ ~] ~ [~ ~ 0 ~] [~ 7 ~ ~]]>" |+ gcRoots) # velocity 0.9  -- chorus
+      , n gcRoots # velocity 0.6  -- breakdown
+      , n ("[0 ~ ~ ~]" |+ gcRoots) # velocity 0.9  -- buildup
+      , n ("<[[0 ~ ~ ~] [~ ~ 0 ~] ~ [~ ~ -1 ~]] [[0 ~ ~ ~] ~ [~ ~ 0 ~] [~ 7 ~ 5]]>" |+ gcRoots) # velocity 0.9  -- chorus2
+      ]
+      [ s "mm_sine" # mpenv 12 # mpdec 0.08 # mdec 1 # mlev 0.4 # shape 0.35 # lvl 0.75  -- intro
+      , s "mm_sine" # mpenv 12 # mpdec 0.08 # mdec 1 # mlev 0.4 # shape 0.4 # lvl 0.75  -- chorus
+      , s "mm_sine" # matt 0.3 # mrel 1.5 # lvl 0.7  -- breakdown
+      , s "mm_sine" # mpenv 24 # mpdec 0.05 # mdec 0.6 # mlev 0.2 # shape 0.4 # lvl 0.75  -- buildup
+      , s "mm_sine" # mpenv 12 # mpdec 0.1 # mdec 1.2 # mlev 0.4 # shape 0.5 # lvl 0.75  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 10: "neon"  --  synthwave: LinnDrum with a huge-room snare,
+--  8th-note sawtooth bass, brassy pads, a saw lead with delay and a
+--  tom fill into the drop.   Sweet spot 100-120 BPM.
+--  Progression: i - VI - III - VII
+-- ---------------------------------------------------------------------
+neProg :: Pattern Note
+neProg = "<[0,2,4] [-2,0,2] [2,4,6] [-1,1,3]>"
+neRoots :: Pattern Note
+neRoots = "<0 -2 2 -1>"
+neon :: Song
+neon = Song
+  { songName = "neon"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [1 ~ 1 ~]!4>"  -- intro
+      , velocity "1 ~ 1 ~"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ 1 ~]!4 [1 1 1 1]!2 [1*8] [1*16]>"  -- buildup
+      , velocity "<[1 ~ 1 ~]!3 [1 ~ 1 [1 1]]>"  -- chorus2
+      ]
+      [ s "LinnDrum_bd" # lpf 1500 # lvl 0.95  -- intro
+      , s "LinnDrum_bd" # lvl 1  -- chorus
+      , s "LinnDrum_bd" # verb 0.5 # lvl 0.9  -- breakdown
+      , s "LinnDrum_bd" # lvl 1  -- buildup
+      , s "LinnDrum_bd" # shape 0.15 # lvl 1  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ ~ [~ 1 ~ 1]>"  -- breakdown
+      , velocity ("<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8] [1*16]>" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 [~ 1] [1 1]]>"  -- chorus2
+      ]
+      [ s "LinnDrum_sd" # verb 0.6 # lvl 0.75  -- intro
+      , s "LinnDrum_sd" # verb 0.75 # lvl 0.8  -- chorus
+      , s "LinnDrum_cp" # verb 0.9 # lvl 0.7  -- breakdown
+      , s "LinnDrum_sd:1" # verb 0.4 # lvl 0.8  -- buildup
+      , s "LinnDrum_sd" # verb 0.8 # shape 0.1 # lvl 0.8  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.3]*4"  -- intro
+      , velocity "[0.6 0.4]*4"  -- chorus
+      , velocity "[~ 0.4]*4"  -- breakdown
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- buildup
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- chorus2
+      ]
+      [ s "LinnDrum_hh" # lvl 0.45  -- intro
+      , s "LinnDrum_hh" # lvl 0.5  -- chorus
+      , s "LinnDrum_oh" # verb 0.5 # lvl 0.35  -- breakdown
+      , s "LinnDrum_hh:1" # lvl 0.5  -- buildup
+      , pan (sway 0.35 0.65 2) # s "LinnDrum_hh" # lvl 0.5  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , silence  -- breakdown
+      , velocity "<~ ~ ~ ~ ~ ~ [~ ~ ~ ~ 1 1 1 1] [1 1 1 1 1 1 1 1]>"  -- buildup
+      , velocity "~ [1 0.6] ~ 1"  -- chorus2
+      ]
+      [ s "LinnDrum_tb" # lvl 0.4  -- intro
+      , s "LinnDrum_tb" # lvl 0.4  -- chorus
+      , s "LinnDrum_tb" # verb 0.5 # lvl 0.35  -- breakdown
+      , s "LinnDrum_lt" # verb 0.5 # lvl 0.6  -- buildup
+      , s "LinnDrum_tb" # pan 0.4 # lvl 0.4  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[4 ~ 4 2 4 ~ 6 ~] [7@3 ~ 6 4 2 ~] [6 ~ 6 4 6 ~ 8 ~] [9@2 8 7 6@2 ~ ~]>" # velocity 0.8  -- chorus
+      , n "<[7@4] [5@4] [6@4] [6@2 ~ ~]>" # velocity 0.6  -- breakdown
+      , n ("[0 2 4 7]*4" |+ neRoots) # velocity "[0.8 0.5 0.6 0.5]*4"  -- buildup
+      , n "<[11 ~ 11 9 11 ~ 13 ~] [14@3 ~ 13 11 9 ~] [13 ~ 13 11 13 ~ 15 ~] [16@2 15 14 13@2 ~ ~]>" # velocity 0.8  -- chorus2
+      ]
+      [ s "mm_saw" # lpf 2000 # mdec 0.3 # mlev 0.4 # lvl 0.3  -- intro
+      , s "mm_saw" # lpf 3000 # resonance 0.1 # delay 0.35 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # verb 0.4 # lvl 0.3  -- chorus
+      , s "mm_pad" # mtone 0.7 # matt 0.4 # mrel 1.5 # verb 0.6 # lvl 0.45  -- breakdown
+      , lpf (rampx "buildup" 800 6000) # s "mm_square" # mdec 0.1 # mlev 0 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.28  -- buildup
+      , s "mm_supersaw" # lpf 4000 # delay 0.35 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # verb 0.4 # lvl 0.25  -- chorus2
+      ]
+  , chordsT = Track
+      [ n neProg # velocity 0.55  -- intro
+      , struct "t@3 t@3 t@2" (n neProg) # velocity 0.65  -- chorus
+      , n neProg # velocity 0.55  -- breakdown
+      , struct "[t ~ t ~]*2" (n neProg) # velocity 0.6  -- buildup
+      , struct "t@3 t@3 t@2" (n neProg) # velocity 0.65  -- chorus2
+      ]
+      [ lpf (rampx "intro" 300 3000) # s "mm_pad" # mtone 0.6 # matt 0.3 # mrel 1.5 # lvl 0.4  -- intro
+      , s "mm_brass" # mtone 0.8 # matt 0.05 # mrel 0.6 # verb 0.4 # lvl 0.4  -- chorus
+      , s "mm_pad" # mtone 0.6 # matt 0.6 # mrel 2 # verb 0.7 # lvl 0.4  -- breakdown
+      , s "mm_brass" # mtone 0.9 # mrel 0.4 # mdec 0.2 # mlev 0.3 # lvl 0.4  -- buildup
+      , pan (sway 0.35 0.65 4) # s "mm_brass" # mtone 0.8 # matt 0.05 # mrel 0.6 # verb 0.4 # lvl 0.4  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("[0 0 0 0 0 0 0 0]" |+ neRoots) # velocity "[0.9 0.6]*4"  -- intro
+      , n ("[0 0 7 0]*2" |+ neRoots) # velocity "[1 0.6 0.8 0.6]*2"  -- chorus
+      , n neRoots # velocity 0.6  -- breakdown
+      , n ("[0 0 0 0]*4" |+ neRoots) # velocity "[1 0.6]*8"  -- buildup
+      , n ("[0 0 7 0]*4" |+ neRoots) # velocity "[1 0.6 0.8 0.6]*4"  -- chorus2
+      ]
+      [ s "mm_saw" # lpf 500 # mdec 0.15 # mlev 0.3 # lvl 0.45  -- intro
+      , s "mm_saw" # lpf 800 # resonance 0.13 # mdec 0.15 # mlev 0.3 # lvl 0.45  -- chorus
+      , s "mm_tri" # matt 0.1 # mrel 1 # lvl 0.6  -- breakdown
+      , lpf (rampx "buildup" 300 2500) # s "mm_saw" # mdec 0.1 # mlev 0.2 # lvl 0.45  -- buildup
+      , lpf (sway 400 1600 4) # s "mm_saw" # resonance 0.17 # mdec 0.12 # mlev 0.3 # lvl 0.45  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 11: "shards"  --  IDM / glitch, an automation study for rhythm:
+--  euclidean drums, ply() stutters that multiply through the buildup,
+--  hi-hat density thinned by an automated degradeBy(), random sometimes-
+--  doubled hits, and bit-crush / sample-rate reduction that sweep.
+--  Sweet spot 110-140 BPM.   Harmony: stacked fourths drifting by step
+-- ---------------------------------------------------------------------
+shProg :: Pattern Note
+shProg = "<[0,3,6,9] [-1,2,5,8] [1,4,7,10] [-2,1,4,7]>"
+shRoots :: Pattern Note
+shRoots = "<0 -1 1 -2>"
+shards :: Song
+shards = Song
+  { songName = "shards"
+  , kickT = Track
+      [ velocity "<1(3,8) 1(3,8,2)>"  -- intro
+      , ply "<1 1 1 2>" (velocity "<1(5,16) 1(5,16,3) 1(7,16) 1(5,16,1)>")  -- chorus
+      , velocity "<~ ~ ~ 1(3,8)>"  -- breakdown
+      , ply "<1 1 2 2 2 3 4 4>" (velocity "1(5,16)")  -- buildup
+      , sometimesBy 0.2 (ply 2) (velocity "<1(5,16) 1(7,16,2) 1(5,16,1) 1(9,16)>")  -- chorus2
+      ]
+      [ s "KorgM1_bd" # lpf 1500 # lvl 0.9  -- intro
+      , s "KorgM1_bd" # crush 8 # lvl 0.85  -- chorus
+      , s "KorgM1_bd" # verb 0.6 # lvl 0.8  -- breakdown
+      , crush (ramp "buildup" 16 4) # s "KorgM1_bd" # lvl 0.85  -- buildup
+      , s "KorgM1_bd:2" # coarse 4 # lvl 0.85  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ [~ ~ 1 ~] [~ ~ 1 [~ 1]]>"  -- intro
+      , velocity "<[~ ~ 1 ~] [~ ~ 1 [~ 1]] [~ 1 ~ 1] [~ ~ [1 1 1] ~]>"  -- chorus
+      , velocity "<~ [~ ~ ~ 1] ~ ~>"  -- breakdown
+      , ply "<1 1 2 2 3 3 4 6>" (velocity "[~ 1]*4")  -- buildup
+      , iter 4 (velocity "<[~ ~ 1 ~] [~ ~ 1 [~ 1]] [~ 1 ~ 1] [~ ~ [1 1 1] ~]>")  -- chorus2
+      ]
+      [ s "KorgM1_sd" # lvl 0.75  -- intro
+      , s "KorgM1_sd:1" # coarse 3 # lvl 0.75  -- chorus
+      , s "KorgM1_cp" # verb 0.7 # lvl 0.7  -- breakdown
+      , coarse (round <$> ramp "buildup" 1 16) # s "KorgM1_sd" # lvl 0.75  -- buildup
+      , crush (drift 4 12 1) # s "KorgM1_sd:2" # lvl 0.75  -- chorus2
+      ]
+  , hatT = Track
+      [ degradeBy 0.5 (velocity "[0.6 0.3 0.5 0.3]*4")  -- intro
+      , degradeBy 0.25 (velocity "[0.7 0.3 0.5 0.3]*4")  -- chorus
+      , degradeBy 0.7 (velocity "[0.4 0.2]*8")  -- breakdown
+      , degradeBy (ramp "buildup" 0.8 0) (velocity "[0.6 0.3 0.5 0.3]*4")  -- buildup
+      , sometimesBy 0.15 (ply 3) (degradeBy (sway 0 0.6 4) (velocity "[0.7 0.3 0.5 0.3]*4"))  -- chorus2
+      ]
+      [ pan (drift 0 1 1) # s "KorgM1_hh" # lvl 0.45  -- intro
+      , pan (drift 0 1 1) # s "KorgM1_hh" # crush 10 # lvl 0.45  -- chorus
+      , s "KorgM1_oh" # verb 0.6 # lvl 0.35  -- breakdown
+      , s "KorgM1_hh:1" # lvl 0.45  -- buildup
+      , pan (drift 0 1 1) # crush (sway 4 12 2) # s "KorgM1_hh" # lvl 0.45  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "1(3,8,1)"  -- intro
+      , sometimesBy 0.3 (ply 2) (velocity "1(3,8,1)")  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , ply 2 (velocity "1(5,8)")  -- buildup
+      , sometimesBy 0.3 (ply 4) (velocity "<1(3,8,1) 1(5,8,2)>")  -- chorus2
+      ]
+      [ speed (drift 0.5 2 1) # s "KorgM1_misc:5" # lvl 0.5  -- intro
+      , speed (drift 0.5 2 1) # s "KorgM1_misc:9" # lvl 0.5  -- chorus
+      , s "KorgM1_misc:12" # verb 0.7 # lvl 0.45  -- breakdown
+      , speed (ramp "buildup" 0.5 3) # s "KorgM1_misc:3" # lvl 0.5  -- buildup
+      , speed (drift 0.25 3 1) # s "KorgM1_misc:14" # coarse 6 # lvl 0.5  -- chorus2
+      ]
+  , leadT = Track
+      [ n ("[0 ~ 7 ~ 3 ~ ~ 10]" |+ shRoots) # velocity 0.6  -- intro
+      , sometimesBy 0.3 (|+ n 7) (n ("[0 7 3 ~ 10 ~ 5 2]*2" |+ shRoots)) # velocity 0.7  -- chorus
+      , n "<[0 ~ ~ ~ 7 ~ ~ ~] ~ [3 ~ ~ ~ ~ ~ 10 ~] ~>" # velocity 0.5  -- breakdown
+      , ply "<1 1 1 1 2 2 2 2>" (n ("[0 3 7 10]*4" |+ shRoots)) # velocity 0.6  -- buildup
+      , sometimesBy 0.3 (|+ n (-7)) (rev (n ("[0 7 3 ~ 10 ~ 5 2]*2" |+ shRoots))) # velocity 0.7  -- chorus2
+      ]
+      [ mfmi (drift 0 4 2) # s "mm_sine" # mfmh 2.5 # mdec 0.12 # mlev 0 # lvl 0.5  -- intro
+      , mfmi (drift 0 8 1) # s "mm_sine" # mfmh 3.5 # mdec 0.08 # mlev 0 # delay 0.25 # delaytime 0.0625 # lock 1 # delayfeedback 0.4 # lvl 0.5  -- chorus
+      , s "mm_bell" # mtone 0.8 # mrel 0.3 # verb 0.7 # lvl 0.45  -- breakdown
+      , mfmi (ramp "buildup" 0 10) # s "mm_sine" # mfmh 1.5 # mdec 0.06 # mlev 0 # lvl 0.5  -- buildup
+      , crush (sway 4 10 2) # mfmi (drift 1 6 1) # s "mm_square" # mfmh 2 # mdec 0.07 # mlev 0 # lvl 0.35  -- chorus2
+      ]
+  , chordsT = Track
+      [ n shProg # velocity 0.5  -- intro
+      , struct "t(3,8)" (n shProg) # velocity 0.6  -- chorus
+      , n shProg # velocity 0.5  -- breakdown
+      , ply "<1 1 1 1 2 2 4 4>" (struct "t(5,8)" (n shProg)) # velocity 0.55  -- buildup
+      , struct "<t(3,8) t(5,8,2)>" (n shProg) # velocity 0.6  -- chorus2
+      ]
+      [ lpf (drift 400 2500 4) # s "mm_bell" # mtone 0.8 # mrel 0.3 # verb 0.5 # lvl 0.4  -- intro
+      , crush (sway 5 12 4) # s "mm_square" # lpf 2500 # mdec 0.2 # mlev 0 # lvl 0.25  -- chorus
+      , pan (sway 0.2 0.8 2) # s "mm_bell" # mtone 0.95 # matt 0.5 # mrel 1.5 # verb 0.7 # lvl 0.4  -- breakdown
+      , coarse (round <$> ramp "buildup" 1 12) # s "mm_square" # lpf 3000 # mdec 0.1 # mlev 0 # lvl 0.25  -- buildup
+      , crush (drift 4 12 1) # s "mm_epiano" # mtone 0.8 # mrel 0.3 # mdec 0.3 # mlev 0 # lvl 0.45  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("[0 ~ ~ 0] ~ [~ 0 ~ ~] ~" |+ shRoots) # velocity 0.8  -- intro
+      , sometimesBy 0.2 (ply 2) (n ("[0 ~ ~ 0] [~ ~ 7 ~] [~ 0 ~ ~] [3 ~ ~ 5]" |+ shRoots)) # velocity 0.85  -- chorus
+      , n shRoots # velocity 0.6  -- breakdown
+      , n ("0(5,16)" |+ shRoots) # velocity 0.8  -- buildup
+      , iter 4 (n ("[0 ~ ~ 0] [~ ~ 7 ~] [~ 0 ~ 3] [~ 5 ~ ~]" |+ shRoots)) # velocity 0.85  -- chorus2
+      ]
+      [ s "mm_square" # lpf 500 # mdec 0.2 # mlev 0.2 # lvl 0.35  -- intro
+      , coarse (round <$> drift 1 10 2) # s "mm_square" # lpf 900 # mdec 0.15 # mlev 0.2 # lvl 0.35  -- chorus
+      , s "mm_sine" # matt 0.2 # mrel 1 # lvl 0.6  -- breakdown
+      , crush (ramp "buildup" 12 3) # s "mm_square" # lpf 1200 # mdec 0.1 # mlev 0 # lvl 0.3  -- buildup
+      , coarse (round <$> sway 1 8 1) # s "mm_saw" # lpf 1000 # mdec 0.15 # mlev 0.2 # lvl 0.35  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 12: "eightbit"  --  chiptune: everything synthesised and
+--  bit-crushed. Pitch-enveloped triangle kick, noise snare and hats,
+--  coin-blip percussion, square-wave arpeggios via arp(), triangle bass.
+--  Sweet spot 130-160 BPM.   Progression: i - iv - VII - v
+-- ---------------------------------------------------------------------
+ebProg :: Pattern Note
+ebProg = "<[0,2,4] [3,5,7] [-1,1,3] [4,6,8]>"
+ebRoots :: Pattern Note
+ebRoots = "<0 3 -1 4>"
+eightbit :: Song
+eightbit = Song
+  { songName = "eightbit"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [1 ~ 1 ~]!4>"  -- intro
+      , velocity "[1 ~ ~ ~] [~ ~ 1 ~] [1 ~ ~ ~] [~ ~ ~ ~]"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ 1 ~]!4 [1 1 1 1]!2 [1*8] [1*16]>"  -- buildup
+      , velocity "<[[1 ~ ~ ~] [~ ~ 1 ~] [1 ~ ~ ~] [~ ~ ~ ~]] [[1 ~ ~ ~] [~ ~ 1 ~] [1 ~ 1 ~] [~ 1 ~ 1]]>"  -- chorus2
+      ]
+      [ s "mm_tri" # note (-27) # mpenv 24 # mpdec 0.04 # mdec 0.12 # mlev 0 # lvl 0.9  -- intro
+      , s "mm_tri" # note (-27) # mpenv 24 # mpdec 0.04 # mdec 0.12 # mlev 0 # crush 6 # lvl 0.9  -- chorus
+      , s "mm_tri" # note (-29) # mpenv 12 # mpdec 0.06 # mdec 0.2 # mlev 0 # lvl 0.85  -- breakdown
+      , s "mm_tri" # note (-27) # mpenv 36 # mpdec 0.03 # mdec 0.1 # mlev 0 # lvl 0.9  -- buildup
+      , s "mm_square" # note (-27) # mpenv 24 # mpdec 0.04 # mdec 0.1 # mlev 0 # crush 5 # lvl 0.6  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ ~ [~ ~ ~ 1]>"  -- breakdown
+      , velocity "<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8] [1*16]>"  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 [1 1] [1 1 1 1]]>"  -- chorus2
+      ]
+      [ s "mm_white" # mdec 0.1 # mlev 0 # hpf 1500 # crush 6 # lvl 0.45  -- intro
+      , s "mm_white" # mdec 0.12 # mlev 0 # hpf 1200 # crush 5 # lvl 0.5  -- chorus
+      , s "mm_pink" # mdec 0.2 # mlev 0 # hpf 800 # crush 6 # verb 0.4 # lvl 0.45  -- breakdown
+      , s "mm_white" # mdec 0.08 # mlev 0 # hpf 2000 # crush 4 # lvl 0.45  -- buildup
+      , s "mm_white" # mdec 0.12 # mlev 0 # hpf 1000 # crush 4 # lvl 0.5  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.3]*4"  -- intro
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- chorus
+      , velocity "[~ 0.4]*4"  -- breakdown
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- buildup
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- chorus2
+      ]
+      [ s "mm_white" # mdec 0.03 # mlev 0 # hpf 7000 # lvl 0.35  -- intro
+      , s "mm_white" # mdec 0.03 # mlev 0 # hpf 8000 # crush 8 # lvl 0.35  -- chorus
+      , s "mm_white" # mdec 0.06 # mlev 0 # hpf 6000 # lvl 0.3  -- breakdown
+      , s "mm_white" # mdec 0.02 # mlev 0 # hpf 9000 # lvl 0.35  -- buildup
+      , pan (sway 0.3 0.7 1) # s "mm_white" # mdec 0.03 # mlev 0 # hpf 7000 # crush 8 # lvl 0.35  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "[~ ~ ~ 1] ~ [~ 1 ~ ~] ~"  -- chorus
+      , velocity "<[~ ~ ~ 1] ~ ~ ~>"  -- breakdown
+      , velocity "[~ 1]*8"  -- buildup
+      , velocity "[~ ~ ~ 1] [~ ~ 1 ~] [~ 1 ~ ~] [1 ~ ~ ~]"  -- chorus2
+      ]
+      [ s "mm_square" # note 36 # mdec 0.04 # mlev 0 # crush 5 # lvl 0.3  -- intro
+      , s "mm_square" # note 36 # mdec 0.04 # mlev 0 # crush 5 # lvl 0.3  -- chorus
+      , s "mm_square" # note 43 # mdec 0.06 # mlev 0 # delay 0.4 # delaytime 0.09375 # lock 1 # delayfeedback 0.5 # lvl 0.25  -- breakdown
+      , note ((\x -> Note (x - 60)) <$> ramp "buildup" 72 108) # s "mm_square" # mdec 0.03 # mlev 0 # crush 5 # lvl 0.28  -- buildup
+      , s "mm_square" # note 40 # mdec 0.04 # mlev 0 # crush 4 # lvl 0.3  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[7 ~ 7 9 11 ~ 9 7] [10 ~ 10 9 7 ~ ~ ~] [8 ~ 8 10 12 ~ 10 8] [11@3 ~ 13 ~ 11 ~]>" # velocity 0.8  -- chorus
+      , n "<[7@4] [10@4] [8@4] [11@4]>" # velocity 0.6  -- breakdown
+      , n ("[0 2 4 7]*4" |+ ebRoots) # velocity 0.7  -- buildup
+      , n "<[14 ~ 14 16 18 ~ 16 14] [17 ~ 17 16 14 ~ ~ ~] [15 ~ 15 17 19 ~ 17 15] [18@3 ~ 20 ~ 18 ~]>" # velocity 0.8  -- chorus2
+      ]
+      [ s "mm_square" # mdec 0.15 # mlev 0.3 # crush 6 # lvl 0.28  -- intro
+      , s "mm_square" # mdec 0.15 # mlev 0.4 # crush 6 # delay 0.2 # delaytime 0.09375 # lock 1 # delayfeedback 0.3 # lvl 0.28  -- chorus
+      , s "mm_tri" # matt 0.02 # mrel 0.4 # mvib 6 # mvibd 0.2 # lvl 0.45  -- breakdown
+      , lpf (rampx "buildup" 800 10000) # s "mm_square" # mdec 0.06 # mlev 0 # crush 5 # lvl 0.28  -- buildup
+      , s "mm_pulse" # mdec 0.15 # mlev 0.4 # crush 7 # delay 0.2 # delaytime 0.09375 # lock 1 # delayfeedback 0.3 # lvl 0.3  -- chorus2
+      ]
+  , chordsT = Track
+      [ arp "updown" (segment 2 (n ebProg)) # velocity 0.6  -- intro
+      , arp "updown" (segment 4 (n ebProg)) # velocity 0.6  -- chorus
+      , arp "updown" (segment 2 (n ebProg)) # velocity 0.5  -- breakdown
+      , arp "updown" (segment "<4!4 8!4>" (n ebProg)) # velocity 0.55  -- buildup
+      , arp "pinkyup" (segment 4 (n ebProg)) # velocity 0.6  -- chorus2
+      ]
+      [ s "mm_square" # mdec 0.08 # mlev 0 # crush 6 # lvl 0.22  -- intro
+      , s "mm_square" # mdec 0.06 # mlev 0 # crush 5 # lvl 0.22  -- chorus
+      , s "mm_tri" # mdec 0.2 # mlev 0 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.35  -- breakdown
+      , lpf (rampx "buildup" 600 8000) # s "mm_square" # mdec 0.05 # mlev 0 # crush 5 # lvl 0.22  -- buildup
+      , pan (sway 0.25 0.75 1) # s "mm_square" # mdec 0.06 # mlev 0 # crush 4 # lvl 0.22  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("[0 ~ 0 ~ 0 ~ 7 ~]" |+ ebRoots) # velocity 0.8  -- intro
+      , n ("[0 ~ 0 7] [0 ~ 0 7] [0 ~ 0 7] [0 7 0 7]" |+ ebRoots) # velocity 0.85  -- chorus
+      , n ebRoots # velocity 0.6  -- breakdown
+      , n ("[0 0 0 0]*4" |+ ebRoots) # velocity 0.8  -- buildup
+      , n ("[0 ~ 0 7] [0 ~ 0 7] [0 ~ 5 7] [0 7 9 7]" |+ ebRoots) # velocity 0.85  -- chorus2
+      ]
+      [ s "mm_tri" # mdec 0.2 # mlev 0.5 # lvl 0.6  -- intro
+      , s "mm_tri" # mdec 0.15 # mlev 0.5 # crush 8 # lvl 0.6  -- chorus
+      , s "mm_tri" # matt 0.05 # mrel 0.6 # lvl 0.6  -- breakdown
+      , s "mm_tri" # mdec 0.08 # mlev 0.3 # crush 6 # lvl 0.6  -- buildup
+      , s "mm_tri" # mdec 0.15 # mlev 0.5 # crush 6 # lvl 0.6  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 13: "autobahn"  --  kosmische / Berlin school: a 16th-note Moog
+--  sequence (real Moog samples from the Dirt-Samples repo on GitHub)
+--  under slow filter automation, KorgMinipops motorik drums, mellotron-
+--  style flute and string pads.   Sweet spot 110-130 BPM.
+--  Harmony: open fifths, four bars on i then four on VI
+-- ---------------------------------------------------------------------
+abProg :: Pattern Note
+abProg = "<[0,4,7]!4 [-2,2,5]!4>"
+abRoots :: Pattern Note
+abRoots = "<0!4 -2!4>"
+autobahn :: Song
+autobahn = Song
+  { songName = "autobahn"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [1 ~ ~ ~ 1 ~ 1 ~]!4>"  -- intro
+      , velocity "1 ~ ~ ~ 1 ~ 1 ~"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ ~ ~ 1 ~ 1 ~]!4 [1 ~ 1 ~ 1 ~ 1 ~]!2 [1 1 1 1 1 1 1 1]!2>"  -- buildup
+      , velocity "1 ~ ~ ~ 1 ~ 1 ~"  -- chorus2
+      ]
+      [ s "KorgMinipops_bd" # lpf 800 # lvl 0.9  -- intro
+      , s "KorgMinipops_bd" # lvl 0.95  -- chorus
+      , s "KorgMinipops_bd" # verb 0.5 # lvl 0.85  -- breakdown
+      , s "KorgMinipops_bd:3" # lvl 0.95  -- buildup
+      , s "KorgMinipops_bd:3" # lvl 0.95  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8]!2>"  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 ~ [1 1]]>"  -- chorus2
+      ]
+      [ s "KorgMinipops_sd" # lvl 0.7  -- intro
+      , s "KorgMinipops_sd" # verb 0.3 # lvl 0.75  -- chorus
+      , s "KorgMinipops_sd:5" # verb 0.6 # lvl 0.65  -- breakdown
+      , s "KorgMinipops_sd:8" # lvl 0.75  -- buildup
+      , s "KorgMinipops_sd:2" # verb 0.3 # lvl 0.75  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.3]*4"  -- intro
+      , velocity "[0.6 0.4]*4"  -- chorus
+      , velocity "[~ 0.4]*4"  -- breakdown
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- buildup
+      , velocity "[~ 1]*4"  -- chorus2
+      ]
+      [ s "KorgMinipops_hh" # lvl 0.45  -- intro
+      , s "KorgMinipops_hh" # lvl 0.5  -- chorus
+      , s "KorgMinipops_oh" # verb 0.5 # lvl 0.35  -- breakdown
+      , s "KorgMinipops_hh:2" # lvl 0.5  -- buildup
+      , s "KorgMinipops_oh" # lvl 0.45  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "[~ 1]*2"  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity "[~ 1]*4"  -- buildup
+      , velocity "[~ 1 ~ ~] [~ ~ 1 ~] [~ 1 ~ ~] [1 ~ ~ ~]"  -- chorus2
+      ]
+      [ s "KorgMinipops_misc" # lvl 0.5  -- intro
+      , s "KorgMinipops_misc:1" # lvl 0.5  -- chorus
+      , s "KorgMinipops_misc:2" # delay 0.5 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.6 # lvl 0.45  -- breakdown
+      , s "KorgMinipops_misc:3" # lvl 0.5  -- buildup
+      , s "KorgMinipops_misc:1" # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.5  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[7@4] [9@2 8 7] [7@4] [4@4] [5@4] [6@2 5 4] [5@4] [2@4]>" # velocity 0.6  -- chorus
+      , n "<[7@8] ~ [9@8] ~ [8@8] ~ [7@8] ~>" # velocity 0.5  -- breakdown
+      , n ("[7 9 11 14]*2" |+ "<0 0 0 0 -2 -2 -2 -2>") # velocity 0.6  -- buildup
+      , n "<[14@4] [16@2 15 14] [14@4] [11@4] [12@4] [13@2 12 11] [12@4] [9@4]>" # velocity 0.6  -- chorus2
+      ]
+      [ s "mm_flute" # mtone 0.4 # mrel 0.4 # lvl 0.45  -- intro
+      , s "mm_flute" # mtone 0.4 # mrel 0.4 # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.45 # verb 0.5 # lvl 0.45  -- chorus
+      , s "mm_flute" # mtone 0.7 # mrel 0.4 # verb 0.8 # lvl 0.45  -- breakdown
+      , lpf (rampx "buildup" 600 8000) # s "ds_moog:2" # basepitch 67 # legato 0.9 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.5  -- buildup
+      , s "mm_flute" # mtone 0.4 # mrel 0.4 # delay 0.45 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.5 # lvl 0.45  -- chorus2
+      ]
+  , chordsT = Track
+      [ n abProg # velocity 0.5  -- intro
+      , n abProg # velocity 0.55  -- chorus
+      , n abProg # velocity 0.5  -- breakdown
+      , struct "[t ~ t ~]*2" (n abProg) # velocity 0.5  -- buildup
+      , n abProg # velocity 0.55  -- chorus2
+      ]
+      [ lpf (rampx "intro" 300 2000) # s "mm_pad" # mtone 0.35 # matt 0.8 # mrel 2 # verb 0.6 # lvl 0.4  -- intro
+      , lpf (drift 800 3000 8) # s "mm_pad" # mtone 0.35 # matt 0.5 # mrel 2 # verb 0.5 # lvl 0.4  -- chorus
+      , pan (sway 0.3 0.7 8) # s "mm_pad" # mtone 0.65 # matt 1 # mrel 3 # verb 0.8 # lvl 0.4  -- breakdown
+      , lpf (rampx "buildup" 500 6000) # s "mm_pad" # mtone 0.7 # mrel 0.4 # mdec 0.2 # mlev 0.4 # lvl 0.4  -- buildup
+      , lpf (drift 1000 4000 4) # s "mm_pad" # mtone 0.65 # matt 0.4 # mrel 2 # verb 0.5 # lvl 0.4  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("[0 0 7 0 3 0 7 5]*2" |+ abRoots) # velocity "[1 0.5 0.7 0.5]*4"  -- intro
+      , n ("[0 0 7 0 3 0 7 5]*2" |+ abRoots) # velocity "[1 0.5 0.7 0.5]*4"  -- chorus
+      , n ("[0 ~ 7 ~ 3 ~ 7 ~]" |+ abRoots) # velocity 0.7  -- breakdown
+      , n ("[0 0 7 0 3 0 7 5]*2" |+ abRoots) # velocity "[1 0.5 0.7 0.5]*4"  -- buildup
+      , n ("[0 0 7 0 3 0 9 7]*2" |+ abRoots) # velocity "[1 0.5 0.7 0.5]*4"  -- chorus2
+      ]
+      [ lpf (rampx "intro" 200 1500) # s "ds_moog:0" # basepitch 43 # legato 0.8 # lvl 0.6  -- intro
+      , lpf (sway 400 2400 8) # s "ds_moog:0" # basepitch 43 # legato 0.8 # resonance 0.17 # delay 0.2 # delaytime 0.1875 # lock 1 # delayfeedback 0.3 # lvl 0.6  -- chorus
+      , lpf (drift 300 1200 4) # s "ds_moog:0" # basepitch 43 # legato 0.9 # verb 0.5 # lvl 0.55  -- breakdown
+      , lpf (rampx "buildup" 300 6000) # s "ds_moog:0" # basepitch 43 # legato 0.7 # resonance 0.27 # lvl 0.6  -- buildup
+      , lpf (sway 500 3500 4) # pan (sway 0.3 0.7 2) # s "ds_moog:0" # basepitch 43 # legato 0.8 # resonance 0.2 # lvl 0.6  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 14: "robots"  --  electro: syncopated TR-505 kicks, handclaps,
+--  cowbell, a square-wave bass and a sawtooth lead pushed through the
+--  vowel() formant filter so it "talks".   Sweet spot 120-130 BPM.
+--  Progression: i - i - VII - VI
+-- ---------------------------------------------------------------------
+roProg :: Pattern Note
+roProg = "<[0,2,4] [0,2,4] [-1,1,3] [-2,0,2]>"
+roRoots :: Pattern Note
+roRoots = "<0 0 -1 -2>"
+robots :: Song
+robots = Song
+  { songName = "robots"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [[1 ~ ~ 1] [~ ~ 1 ~] [~ ~ 1 ~] ~]!4>"  -- intro
+      , velocity "<[[1 ~ ~ 1] [~ ~ 1 ~] [~ ~ 1 ~] ~] [[1 ~ ~ 1] [~ ~ 1 ~] [~ 1 ~ ~] [1 ~ ~ ~]]>"  -- chorus
+      , velocity "<~ ~ ~ [[1 ~ ~ 1] ~ ~ ~]>"  -- breakdown
+      , velocity "<[1 ~ 1 ~]!4 [1 1 1 1]!2 [1*8] [1*16]>"  -- buildup
+      , velocity "<[[1 ~ ~ 1] [~ ~ 1 ~] [~ ~ 1 ~] ~] [[1 ~ ~ 1] [~ ~ 1 ~] [~ 1 ~ ~] [1 ~ 1 ~]]>"  -- chorus2
+      ]
+      [ s "RolandTR505_bd" # lpf 1200 # lvl 0.95  -- intro
+      , s "RolandTR505_bd" # lvl 1  -- chorus
+      , s "RolandTR505_bd" # verb 0.6 # lvl 0.9  -- breakdown
+      , s "RolandTR505_bd" # lvl 1  -- buildup
+      , s "RolandTR505_bd" # shape 0.25 # lvl 0.95  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ [~ ~ ~ 1] [~ 1 ~ 1]>"  -- breakdown
+      , velocity ("<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8] [1*16]>" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "<[~ 1 ~ 1]!3 [~ 1 ~ [1 1 1]]>"  -- chorus2
+      ]
+      [ s "RolandTR505_cp" # lvl 0.75  -- intro
+      , s "RolandTR505_cp" # verb 0.2 # lvl 0.8  -- chorus
+      , s "RolandTR505_cp" # verb 0.7 # lvl 0.7  -- breakdown
+      , s "RolandTR505_sd" # lvl 0.75  -- buildup
+      , s "RolandTR505_cp" # delay 0.2 # delaytime 0.09375 # lock 1 # delayfeedback 0.3 # lvl 0.8  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.6 0.3 0.4 0.3]*4"  -- intro
+      , velocity "[0.7 0.4 0.5 0.4]*4"  -- chorus
+      , velocity "[~ 0.4]*4"  -- breakdown
+      , velocity "[0.7 0.4 0.5 0.4]*4"  -- buildup
+      , velocity "[~ 1]*4"  -- chorus2
+      ]
+      [ s "RolandTR505_hh" # lvl 0.45  -- intro
+      , pan (sway 0.3 0.7 1) # s "RolandTR505_hh" # lvl 0.45  -- chorus
+      , s "RolandTR505_oh" # verb 0.5 # lvl 0.35  -- breakdown
+      , hpf (rampx "buildup" 300 7000) # s "RolandTR505_hh" # lvl 0.45  -- buildup
+      , s "RolandTR505_oh" # lvl 0.45  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "[~ ~ ~ 1] [~ ~ 1 ~] ~ [~ 1 ~ ~]"  -- chorus
+      , velocity "<[~ ~ ~ 1] ~ ~ ~>"  -- breakdown
+      , velocity "[~ ~ 1 ~]*4"  -- buildup
+      , velocity "[~ ~ ~ 1] [~ ~ 1 ~] [~ ~ ~ 1] [~ 1 ~ 1]"  -- chorus2
+      ]
+      [ s "RolandTR505_cb" # lvl 0.45  -- intro
+      , s "RolandTR505_cb" # lvl 0.45  -- chorus
+      , s "RolandTR505_cb" # delay 0.5 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # lvl 0.4  -- breakdown
+      , s "RolandTR505_rim" # lvl 0.5  -- buildup
+      , s "RolandTR505_cb" # pan 0.7 # lvl 0.45  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[0 ~ 0 ~ 3 ~ 2 ~] [0 ~ ~ 0 -1 ~ 0 ~] [-1 ~ -1 ~ 1 ~ 0 ~] [-2 ~ ~ ~ 0 ~ ~ ~]>" # velocity 0.8  -- chorus
+      , n "<[0@4] [2@4] [1@4] [0@4]>" # velocity 0.6  -- breakdown
+      , n ("[0 0 0 0]*4" |+ "<0 0 0 0 2 2 4 4>") # velocity 0.7  -- buildup
+      , n "<[7 ~ 7 ~ 10 ~ 9 ~] [7 ~ ~ 7 6 ~ 7 ~] [6 ~ 6 ~ 8 ~ 7 ~] [5 ~ ~ ~ 7 ~ ~ ~]>" # velocity 0.8  -- chorus2
+      ]
+      [ s "mm_saw" # vowel "a" # lpf 3000 # lvl 0.35  -- intro
+      , s "mm_saw" # vowel "<a o e i>" # lpf 3500 # lvl 0.35  -- chorus
+      , s "mm_saw" # vowel "o" # matt 0.2 # mrel 0.8 # verb 0.6 # lvl 0.3  -- breakdown
+      , lpf (rampx "buildup" 600 6000) # s "mm_saw" # vowel "a" # lvl 0.35  -- buildup
+      , s "mm_square" # vowel "<e i a o>" # delay 0.25 # delaytime 0.09375 # lock 1 # delayfeedback 0.3 # lvl 0.3  -- chorus2
+      ]
+  , chordsT = Track
+      [ n roProg # velocity 0.5  -- intro
+      , struct "[t ~ ~ ~] ~ [~ ~ t ~] ~" (n roProg) # velocity 0.6  -- chorus
+      , n roProg # velocity 0.5  -- breakdown
+      , struct "[t ~ t ~]*2" (n roProg) # velocity 0.55  -- buildup
+      , struct "[t ~ ~ t] ~ [~ ~ t ~] [~ t ~ ~]" (n roProg) # velocity 0.6  -- chorus2
+      ]
+      [ lpf (rampx "intro" 300 3000) # s "mm_pad" # mtone 0.7 # matt 0.4 # mrel 1.5 # lvl 0.4  -- intro
+      , s "mm_pad" # mtone 0.7 # matt 0.05 # mrel 0.6 # lvl 0.4  -- chorus
+      , s "mm_bell" # mtone 0.95 # matt 0.6 # mrel 2 # verb 0.7 # lvl 0.4  -- breakdown
+      , s "mm_pad" # mtone 0.7 # mrel 0.4 # mdec 0.1 # mlev 0.3 # lvl 0.4  -- buildup
+      , s "mm_brass" # mtone 0.9 # matt 0.02 # mrel 0.5 # lvl 0.4  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("<~ ~ ~ ~ [0 ~ ~ 0 ~ ~ 0 ~]!4>" |+ roRoots)  -- intro
+      , n ("[0 0 ~ 0] [~ 0 3 ~] [0 ~ 0 ~] [5 ~ 3 ~]" |+ roRoots) # velocity 0.85  -- chorus
+      , n roRoots # velocity 0.6  -- breakdown
+      , n ("[0 0 0 0]*4" |+ roRoots) # velocity "[1 0.6]*8"  -- buildup
+      , n ("[0 0 ~ 0] [~ 0 3 ~] [0 ~ 0 7] [5 ~ 3 ~]" |+ roRoots) # velocity 0.85  -- chorus2
+      ]
+      [ s "mm_square" # lpf 500 # mdec 0.15 # mlev 0.2 # lvl 0.35  -- intro
+      , s "mm_square" # lpf 700 # resonance 0.2 # mdec 0.12 # mlev 0.2 # lvl 0.35  -- chorus
+      , s "mm_sine" # matt 0.1 # mrel 1 # lvl 0.6  -- breakdown
+      , lpf (rampx "buildup" 300 3000) # s "mm_square" # mdec 0.1 # mlev 0.1 # lvl 0.35  -- buildup
+      , lpf (sway 400 1400 2) # s "mm_saw" # resonance 0.27 # mdec 0.12 # mlev 0.2 # lvl 0.35  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 15: "caju"  --  bossa nova, fully acoustic: nylon guitar comping
+--  in a two-bar bossa rhythm, real fretless-bass samples from GitHub
+--  (fl_bass), cross-stick clave, shaker and guiro, a flute melody and a
+--  rubato Salamander-piano breakdown.   Sweet spot 120-140 BPM.
+--  Progression: i7 - i7 - ii(half-dim)7 - v7
+-- ---------------------------------------------------------------------
+cjProg :: Pattern Note
+cjProg = "<[0,2,4,6] [0,2,4,6] [1,3,5,7] [-3,-1,1,3]>"
+cjRoots :: Pattern Note
+cjRoots = "<0 0 1 -3>"
+cjComp :: Pattern Bool
+cjComp = "<[[t ~ ~ t] [~ ~ t ~] [~ ~ t ~] [~ t ~ ~]] [[~ ~ t ~] [~ t ~ ~] [t ~ ~ t] [~ ~ t ~]]>"
+cjClave :: Pattern Double
+cjClave = "<[[0.7 ~ ~ 0.7] [~ ~ 0.7 ~] [~ ~ 0.7 ~] ~] [[~ ~ 0.7 ~] [~ ~ 0.7 ~] [~ 0.7 ~ ~] [0.7 ~ ~ ~]]>"
+caju :: Song
+caju = Song
+  { songName = "caju"
+  , kickT = Track
+      [ silence  -- intro
+      , velocity "[0.8 ~ ~ ~] [~ ~ 0.6 ~] [0.8 ~ ~ ~] [~ ~ 0.6 ~]"  -- chorus
+      , silence  -- breakdown
+      , velocity ("[0.8 ~ ~ ~] [~ ~ 0.6 ~] [0.8 ~ ~ ~] [~ ~ 0.6 ~]" |* (ramp "buildup" 0.6 1))  -- buildup
+      , velocity "[0.8 ~ ~ ~] [~ ~ 0.6 ~] [0.8 ~ ~ 0.5] [~ ~ 0.6 ~]"  -- chorus2
+      ]
+      [ s "bassdrum1" # lpf 800 # lvl 0.7  -- intro
+      , s "bassdrum1" # lpf 900 # lvl 0.75  -- chorus
+      , s "bassdrum1" # verb 0.5 # lvl 0.7  -- breakdown
+      , s "bassdrum1" # lvl 0.75  -- buildup
+      , s "cajon" # lpf 1500 # lvl 0.8  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [[0.7 ~ ~ 0.7] [~ ~ 0.7 ~] [~ ~ 0.7 ~] ~] [[~ ~ 0.7 ~] [~ ~ 0.7 ~] [~ 0.7 ~ ~] [0.7 ~ ~ ~]] [[0.7 ~ ~ 0.7] [~ ~ 0.7 ~] [~ ~ 0.7 ~] ~] [[~ ~ 0.7 ~] [~ ~ 0.7 ~] [~ 0.7 ~ ~] [0.7 ~ ~ ~]]>"  -- intro
+      , velocity cjClave  -- chorus
+      , silence  -- breakdown
+      , velocity cjClave  -- buildup
+      , velocity cjClave  -- chorus2
+      ]
+      [ s "snare_rim" # lvl 0.6  -- intro
+      , s "snare_rim" # lvl 0.65  -- chorus
+      , s "snare_rim" # verb 0.5 # lvl 0.55  -- breakdown
+      , s "snare_rim:1" # lvl 0.65  -- buildup
+      , s "snare_rim:2" # lvl 0.65  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.3 0.4 0.3]*4"  -- intro
+      , velocity "[0.5 0.3 0.4 0.3]*4"  -- chorus
+      , velocity "[0.3 0.2]*4"  -- breakdown
+      , velocity "[0.5 0.3 0.4 0.3]*4"  -- buildup
+      , velocity "[0.6 0.3 0.5 0.3]*4"  -- chorus2
+      ]
+      [ s "shaker_small" # lvl 0.4  -- intro
+      , s "shaker_small" # lvl 0.45  -- chorus
+      , s "cabasa" # verb 0.4 # lvl 0.35  -- breakdown
+      , s "shaker_large" # lvl 0.4  -- buildup
+      , pan (sway 0.35 0.65 2) # s "shaker_small" # lvl 0.45  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "[1 ~ 0.6 0.6] ~ [1 ~ 0.6 0.6] ~"  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity "[1 ~ 0.6 0.6] ~ [1 ~ 0.6 0.6] ~"  -- buildup
+      , velocity "[1 ~ 0.6 0.6] ~ [1 ~ 0.6 0.6] [~ ~ 1 ~]"  -- chorus2
+      ]
+      [ s "guiro" # lvl 0.4  -- intro
+      , s "guiro" # lvl 0.45  -- chorus
+      , s "triangles:3" # verb 0.5 # lvl 0.35  -- breakdown
+      , s "guiro:2" # lvl 0.45  -- buildup
+      , s "guiro" # pan 0.6 # lvl 0.45  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[4@3 ~ 5 4 2 ~] [4@6 ~ ~] [5@3 ~ 6 5 3 ~] [4@6 ~ ~]>" # velocity 0.7  -- chorus
+      , n "<[7@6 ~ ~] [6@6 ~ ~] [5@6 ~ ~] [4@6 ~ ~]>" # velocity 0.55  -- breakdown
+      , n ("[0 2 4 6]*2" |+ "<0 0 1 -3 0 0 1 -3>") # velocity 0.6  -- buildup
+      , n "<[7@3 ~ 8 7 5 ~] [7@6 ~ ~] [8@3 ~ 9 8 6 ~] [7@6 ~ ~]>" # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_flute" # mtone 0.4 # mrel 0.4 # verb 0.4 # lvl 0.45  -- intro
+      , s "mm_flute" # mtone 0.4 # mrel 0.4 # verb 0.4 # lvl 0.5  -- chorus
+      , s "superpiano" # verb 0.5 # lvl 0.6  -- breakdown
+      , s "mm_flute" # mtone 0.4 # mrel 0.4 # verb 0.3 # lvl 0.5  -- buildup
+      , s "mm_flute" # mtone 0.4 # mrel 0.4 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.3 # verb 0.4 # lvl 0.5  -- chorus2
+      ]
+  , chordsT = Track
+      [ struct cjComp (n cjProg) # velocity 0.6  -- intro
+      , struct cjComp (n cjProg) # velocity 0.65  -- chorus
+      , n cjProg # velocity 0.55  -- breakdown
+      , struct cjComp (n cjProg) # velocity 0.65  -- buildup
+      , struct cjComp (n cjProg) # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_pluck" # mtone 0.4 # mrel 0.3 # lvl 0.6  -- intro
+      , s "mm_pluck" # mtone 0.4 # mrel 0.3 # verb 0.25 # lvl 0.65  -- chorus
+      , s "superpiano" # release 1 # verb 0.5 # lvl 0.55  -- breakdown
+      , s "mm_pluck" # mtone 0.4 # mrel 0.2 # lvl 0.65  -- buildup
+      , s "mm_pluck" # mtone 0.4 # mrel 0.3 # verb 0.35 # lvl 0.65  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("<~ ~ ~ ~ [0@3 4 4@3 0]!4>" |+ cjRoots)  -- intro
+      , n ("[0@3 4 4@3 0]" |+ cjRoots) # velocity 0.85  -- chorus
+      , n cjRoots # velocity 0.6  -- breakdown
+      , n ("[0@3 4 4@3 0]" |+ cjRoots) # velocity 0.85  -- buildup
+      , n ("<[0@3 4 4@3 0] [0@3 4 4 2 1 -1]>" |+ cjRoots) # velocity 0.85  -- chorus2
+      ]
+      [ s "fl_bass:0" # basepitch 36 # legato 1 # lvl 0.8  -- intro
+      , s "fl_bass:0" # basepitch 36 # legato 1 # lvl 0.85  -- chorus
+      , s "mm_bass" # mtone 0.1 # mrel 0.3 # verb 0.3 # lvl 0.7  -- breakdown
+      , s "fl_bass:0" # basepitch 36 # legato 1 # lvl 0.85  -- buildup
+      , s "fl_bass:0" # basepitch 36 # legato 1 # verb 0.2 # lvl 0.85  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 16: "pulse"  --  chamber minimalism, fully acoustic: pizzicato
+--  strings arpeggiating in 8ths against a 12-note marimba figure (a 3:2
+--  polyrhythm), timpani, frame drum, and a hand-clap line that phases one
+--  step in chorus2, after Reich's Clapping Music. Violin and cello lines.
+--  Sweet spot 100-130 BPM.   Progression: i - ii(dim) - VII - VI
+-- ---------------------------------------------------------------------
+puProg :: Pattern Note
+puProg = "<[0,2,4] [1,3,5] [-1,1,3] [-2,0,2]>"
+puRoots :: Pattern Note
+puRoots = "<0 1 -1 -2>"
+chamber :: Song
+chamber = Song
+  { songName = "pulse"
+  , kickT = Track
+      [ velocity "<0.7 ~ ~ ~>"  -- intro
+      , velocity "0.8 ~ ~ ~"  -- chorus
+      , silence  -- breakdown
+      , velocity "<[1 ~ ~ ~]!4 [1 ~ 1 ~]!2 [1 1 1 1] [1*8]>"  -- buildup
+      , velocity "0.8 ~ 0.5 ~"  -- chorus2
+      ]
+      [ s "timpani:2" # verb 0.6 # lvl 0.7  -- intro
+      , s "timpani:2" # verb 0.5 # lvl 0.75  -- chorus
+      , s "timpani:2" # verb 0.8 # lvl 0.65  -- breakdown
+      , s "timpani_roll" # verb 0.4 # lvl 0.7  -- buildup
+      , s "timpani:4" # verb 0.5 # lvl 0.75  -- chorus2
+      ]
+  , snareT = Track
+      [ silence  -- intro
+      , velocity "~ 0.6 ~ 0.6"  -- chorus
+      , silence  -- breakdown
+      , velocity ("[~ 0.5]*4" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "~ 0.6 ~ [0.6 0.4]"  -- chorus2
+      ]
+      [ s "framedrum" # lvl 0.6  -- intro
+      , s "framedrum" # verb 0.4 # lvl 0.6  -- chorus
+      , s "framedrum:3" # verb 0.7 # lvl 0.55  -- breakdown
+      , s "framedrum:5" # lvl 0.6  -- buildup
+      , s "framedrum" # verb 0.4 # lvl 0.6  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "<[~ ~ 0.5 ~] ~ ~ ~>"  -- intro
+      , velocity "[0.4 0.25]*4"  -- chorus
+      , velocity "<0.4 ~ ~ ~>"  -- breakdown
+      , velocity "[0.4 0.25 0.3 0.25]*4"  -- buildup
+      , velocity "[0.4 0.25]*4"  -- chorus2
+      ]
+      [ s "triangles" # verb 0.6 # lvl 0.35  -- intro
+      , s "cabasa" # lvl 0.35  -- chorus
+      , s "triangles:8" # verb 0.8 # lvl 0.35  -- breakdown
+      , s "cabasa" # lvl 0.35  -- buildup
+      , s "shaker_large" # lvl 0.35  -- chorus2
+      ]
+  , percT = Track
+      [ silence  -- intro
+      , velocity "1 1 1 ~ 1 1 ~ 1 ~ 1 1 ~"  -- chorus
+      , velocity "<[1 1 1 ~ 1 1 ~ 1 ~ 1 1 ~] ~ ~ ~>"  -- breakdown
+      , velocity "1 1 1 ~ 1 1 ~ 1 ~ 1 1 ~"  -- buildup
+      , velocity "1 1 ~ 1 1 ~ 1 ~ 1 1 ~ 1"  -- chorus2
+      ]
+      [ s "clap" # lvl 0.5  -- intro
+      , s "clap" # verb 0.3 # lvl 0.5  -- chorus
+      , s "woodblock" # verb 0.6 # lvl 0.45  -- breakdown
+      , s "woodblock:2" # lvl 0.5  -- buildup
+      , s "clap:3" # verb 0.3 # lvl 0.5  -- chorus2
+      ]
+  , leadT = Track
+      [ n ("[0 2 4 7 4 2]*2" |+ puRoots) # velocity "0.7 0.5 0.5 0.6 0.5 0.5"  -- intro
+      , n "<[4@4] [5@2 3@2] [3@4] [2@2 0@2]>" # velocity 0.7  -- chorus
+      , n "<[2@3 0] [1@4] [-1@3 1] [0@4]>" # velocity 0.6  -- breakdown
+      , n "<4 4 5 5 6 6 7 7>" # velocity 0.7  -- buildup
+      , n "<[11@4] [12@2 10@2] [10@4] [9@2 7@2]>" # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_mallet" # mtone 0.15 # mrel 0.3 # lvl 0.6  -- intro
+      , s "mm_bowed" # mtone 0.6 # matt 0.1 # mrel 0.6 # verb 0.5 # lvl 0.5  -- chorus
+      , s "mm_bowed" # mtone 0.4 # matt 0.15 # mrel 0.8 # verb 0.6 # lvl 0.55  -- breakdown
+      , s "mm_bowed" # mtone 0.5 # mvib 9 # mvibd 0.15 # matt 0.2 # mrel 0.5 # lvl 0.5  -- buildup
+      , s "mm_bowed" # mtone 0.6 # matt 0.1 # mrel 0.6 # verb 0.5 # lvl 0.5  -- chorus2
+      ]
+  , chordsT = Track
+      [ arp "updown" (segment 2 (n puProg)) # velocity 0.55  -- intro
+      , arp "updown" (segment 2 (n puProg)) # velocity 0.6  -- chorus
+      , arp "updown" (segment 1 (n puProg)) # velocity 0.5  -- breakdown
+      , arp "updown" (segment 4 (n puProg)) # velocity 0.55  -- buildup
+      , arp "pinkyup" (segment 2 (n puProg)) # velocity 0.6  -- chorus2
+      ]
+      [ s "mm_pluck" # mtone 0.2 # mrel 0.3 # lvl 0.6  -- intro
+      , s "mm_pluck" # mtone 0.2 # mrel 0.3 # verb 0.3 # lvl 0.6  -- chorus
+      , s "superpiano" # verb 0.6 # lvl 0.55  -- breakdown
+      , s "mm_mallet" # mtone 0.15 # mrel 0.3 # lvl 0.6  -- buildup
+      , s "mm_pluck" # mtone 0.2 # mrel 0.3 # verb 0.35 # lvl 0.6  -- chorus2
+      ]
+  , bassT = Track
+      [ n puRoots # velocity 0.6  -- intro
+      , n ("0 ~ 0 ~" |+ puRoots) # velocity 0.7  -- chorus
+      , n puRoots # velocity 0.55  -- breakdown
+      , n ("[0 0 0 0]*2" |+ puRoots) # velocity 0.7  -- buildup
+      , n ("0 ~ 4 ~" |+ puRoots) # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_bowed" # mtone 0.4 # matt 0.2 # mrel 1 # verb 0.4 # lvl 0.55  -- intro
+      , s "mm_bowed" # mtone 0.4 # mrel 0.5 # verb 0.4 # lvl 0.6  -- chorus
+      , s "mm_bowed" # mtone 0.2 # matt 0.3 # mrel 1.5 # verb 0.6 # lvl 0.6  -- breakdown
+      , s "mm_bowed" # mtone 0.4 # mrel 0.2 # lvl 0.6  -- buildup
+      , s "mm_bowed" # mtone 0.2 # mrel 0.5 # verb 0.4 # lvl 0.6  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 17: "kotekan"  --  gamelan-inspired: interlocking 16th-note
+--  glockenspiel figures over a vibraphone ostinato, an FM-synthesised
+--  gong-metallophone bass, a gong every two bars, hand-drum, small
+--  cymbals and a slit-drum offbeat.   Sweet spot 110-140 BPM.
+--  Tip: try the phrygian mode for a pelog-like colour.
+-- ---------------------------------------------------------------------
+ktCore :: Pattern Note
+ktCore = "<0 2 1 -1>"
+kotekan :: Song
+kotekan = Song
+  { songName = "kotekan"
+  , kickT = Track
+      [ velocity "<1 ~>"  -- intro
+      , velocity "<1 ~>"  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity "<1 ~ 1 ~ 1 1 [1 1] [1 1 1 1]>"  -- buildup
+      , velocity "<1 [~ ~ 0.6 ~]>"  -- chorus2
+      ]
+      [ s "gong" # lpf 1500 # verb 0.6 # lvl 0.7  -- intro
+      , s "gong" # verb 0.5 # lvl 0.75  -- chorus
+      , s "gong2" # verb 0.8 # lvl 0.7  -- breakdown
+      , s "gong:3" # lvl 0.7  -- buildup
+      , s "gong2:2" # verb 0.5 # lvl 0.75  -- chorus2
+      ]
+  , snareT = Track
+      [ silence  -- intro
+      , velocity "[1 ~ 0.5 ~] [~ 0.7 ~ 0.5] [1 ~ ~ 0.5] [~ 0.7 1 ~]"  -- chorus
+      , velocity "<[1 ~ ~ ~] ~ [~ ~ 0.7 ~] ~>"  -- breakdown
+      , velocity ("[1 ~ 0.5 ~] [~ 0.7 ~ 0.5] [1 ~ ~ 0.5] [~ 0.7 1 ~]" |* (ramp "buildup" 0.5 1))  -- buildup
+      , velocity "[1 ~ 0.5 0.5] [~ 0.7 ~ 0.5] [1 ~ 0.5 0.5] [~ 0.7 1 0.7]"  -- chorus2
+      ]
+      [ s "darbuka" # lvl 0.6  -- intro
+      , s "darbuka:2" # lvl 0.6  -- chorus
+      , s "darbuka:5" # verb 0.6 # lvl 0.55  -- breakdown
+      , s "bongo:4" # lvl 0.6  -- buildup
+      , s "darbuka:2" # verb 0.2 # lvl 0.6  -- chorus2
+      ]
+  , hatT = Track
+      [ silence  -- intro
+      , degradeBy 0.2 (velocity "[0.6 0.4 0.6 0.4]*4")  -- chorus
+      , silence  -- breakdown
+      , degradeBy (ramp "buildup" 0.7 0) (velocity "[0.6 0.4 0.6 0.4]*4")  -- buildup
+      , degradeBy 0.1 (velocity "[0.6 0.4 0.6 0.4]*4")  -- chorus2
+      ]
+      [ s "clash2" # legato 0.5 # hpf 3000 # lvl 0.3  -- intro
+      , s "clash2:1" # legato 0.5 # hpf 3000 # lvl 0.3  -- chorus
+      , s "fingercymbal" # verb 0.6 # lvl 0.35  -- breakdown
+      , s "clash2" # legato 0.4 # hpf 4000 # lvl 0.3  -- buildup
+      , pan (sway 0.3 0.7 1) # s "clash2:1" # legato 0.5 # hpf 3000 # lvl 0.3  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<~ ~ [~ 1]*4 [~ 1]*4>"  -- intro
+      , velocity "[~ 1]*4"  -- chorus
+      , velocity "[~ 0.6]*2"  -- breakdown
+      , velocity "[~ 1]*4"  -- buildup
+      , velocity "[~ 1 ~ 0.6]*4"  -- chorus2
+      ]
+      [ s "slitdrum:2" # lvl 0.5  -- intro
+      , s "slitdrum:2" # lvl 0.55  -- chorus
+      , s "slitdrum:4" # verb 0.6 # lvl 0.5  -- breakdown
+      , s "slitdrum:1" # lvl 0.55  -- buildup
+      , s "slitdrum:2" # pan 0.4 # lvl 0.55  -- chorus2
+      ]
+  , leadT = Track
+      [ n ("[0 1 0 2 0 1 0 2]*2" |+ "<4 6 5 3>") # velocity "[0.7 0.5]*8"  -- intro
+      , n ("[0 1 0 2 0 1 0 2]*2" |+ "<4 6 5 3>") # velocity "[0.8 0.5]*8"  -- chorus
+      , n "<[4 ~ 6 ~ 5 ~ 4 ~] [6 ~ 8 ~ 7 ~ 6 ~] [5 ~ 7 ~ 6 ~ 5 ~] [3 ~ 5 ~ 4 ~ 3 ~]>" # velocity 0.6  -- breakdown
+      , ply "<1 1 1 1 1 1 2 2>" (n ("[0 1 0 2 0 1 0 2]*2" |+ "<4 4 6 6 5 5 3 3>")) # velocity "[0.8 0.5]*8"  -- buildup
+      , n ("[0 2 1 2 0 2 1 3]*2" |+ "<4 6 5 3>") # velocity "[0.8 0.5]*8"  -- chorus2
+      ]
+      [ s "mm_bell" # mtone 0.3 # mrel 0.3 # verb 0.4 # lvl 0.45  -- intro
+      , s "mm_bell" # mtone 0.3 # mrel 0.3 # verb 0.4 # lvl 0.5  -- chorus
+      , s "mm_bell" # mtone 0.1 # mrel 0.3 # verb 0.7 # lvl 0.5  -- breakdown
+      , s "mm_bell" # mtone 0.3 # mrel 0.3 # lvl 0.5  -- buildup
+      , s "mm_bell" # mtone 0.3 # mrel 0.3 # pan 0.6 # verb 0.4 # lvl 0.5  -- chorus2
+      ]
+  , chordsT = Track
+      [ n ("[0 2 4 2]*2" |+ ktCore) # velocity 0.6  -- intro
+      , n ("[0 2 4 2]*2" |+ ktCore) # velocity 0.65  -- chorus
+      , n ("[0 ~ 4 ~]" |+ ktCore) # velocity 0.55  -- breakdown
+      , n ("[0 2 4 2]*4" |+ ktCore) # velocity 0.6  -- buildup
+      , n ("[0 2 4 2 0 4 2 4]" |+ ktCore) # velocity 0.65  -- chorus2
+      ]
+      [ s "mm_mallet" # mtone 0.4 # mrel 0.3 # lvl 0.55  -- intro
+      , s "mm_mallet" # mtone 0.4 # mrel 0.3 # verb 0.3 # lvl 0.55  -- chorus
+      , s "mm_mallet" # mtone 0.4 # mrel 0.3 # verb 0.7 # lvl 0.5  -- breakdown
+      , s "mm_mallet" # mtone 0.15 # mrel 0.3 # lvl 0.55  -- buildup
+      , s "mm_mallet" # mtone 0.4 # mrel 0.3 # pan 0.4 # verb 0.3 # lvl 0.55  -- chorus2
+      ]
+  , bassT = Track
+      [ silence  -- intro
+      , n "<[0@2 2@2] [4@2 2@2] [1@2 0@2] [-1@2 0@2]>" # velocity 0.8  -- chorus
+      , n ktCore # velocity 0.7  -- breakdown
+      , n ("[0 0 0 0]" |+ ktCore) # velocity 0.8  -- buildup
+      , n "<[0 2 0 2] [4 2 4 2] [1 0 1 0] [-1 0 -1 0]>" # velocity 0.8  -- chorus2
+      ]
+      [ s "mm_sine" # mfmi 2 # mfmh 1.41 # mdec 1.5 # mlev 0 # lvl 0.6  -- intro
+      , s "mm_sine" # mfmi 2 # mfmh 1.41 # mdec 1.5 # mlev 0 # verb 0.3 # lvl 0.6  -- chorus
+      , mfmi (drift 1 4 4) # s "mm_sine" # mfmh 1.41 # mdec 3 # mlev 0 # verb 0.6 # lvl 0.6  -- breakdown
+      , s "mm_sine" # mfmi 3 # mfmh 1.41 # mdec 0.5 # mlev 0 # lvl 0.6  -- buildup
+      , s "mm_sine" # mfmi 2.5 # mfmh 3.5 # mdec 1.2 # mlev 0 # verb 0.3 # lvl 0.55  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 18: "palmwine"  --  West African highlife in 12/8: every bar has
+--  12 steps, so mixing it with the 16-step songs creates cross-rhythms.
+--  Bell pattern on agogo, conga slaps, shaker, picked clean guitar,
+--  trumpet and alto-sax lines, finger bass.   Sweet spot 100-120 BPM.
+--  Tip: the major or mixolydian mode suits it.   Progression: i - iv - v - i
+-- ---------------------------------------------------------------------
+pwProg :: Pattern Note
+pwProg = "<[0,2,4] [3,5,7] [4,6,8] [0,2,4]>"
+pwRoots :: Pattern Note
+pwRoots = "<0 3 4 0>"
+palmwine :: Song
+palmwine = Song
+  { songName = "palmwine"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [1 ~ ~ 1 ~ ~ 1 ~ ~ 1 ~ ~]!4>"  -- intro
+      , velocity "1 ~ ~ 1 ~ ~ 1 ~ ~ 1 ~ ~"  -- chorus
+      , velocity "<[1 ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~] ~>"  -- breakdown
+      , velocity "<[1 ~ ~ 1 ~ ~ 1 ~ ~ 1 ~ ~]!4 [1 ~ 1 1 ~ 1 1 ~ 1 1 ~ 1]!4>"  -- buildup
+      , velocity "1 ~ ~ 1 ~ ~ 1 ~ ~ 1 ~ 0.6"  -- chorus2
+      ]
+      [ s "bassdrum1" # lpf 900 # lvl 0.8  -- intro
+      , s "bassdrum1" # lpf 1200 # lvl 0.85  -- chorus
+      , s "bassdrum1" # verb 0.6 # lvl 0.8  -- breakdown
+      , s "bassdrum2:3" # lvl 0.85  -- buildup
+      , s "bassdrum1" # lpf 1500 # lvl 0.85  -- chorus2
+      ]
+  , snareT = Track
+      [ silence  -- intro
+      , velocity "~ ~ ~ ~ ~ ~ 1 ~ ~ ~ 0.6 ~"  -- chorus
+      , velocity "<~ [~ ~ ~ ~ ~ ~ 1 ~ ~ ~ ~ ~]>"  -- breakdown
+      , velocity "<[~ ~ ~ ~ ~ ~ 1 ~ ~ ~ 0.6 ~]!4 [~ ~ 1 ~ ~ 1 ~ ~ 1 ~ 1 1]!4>"  -- buildup
+      , velocity "~ ~ 0.5 ~ ~ ~ 1 ~ ~ ~ 0.6 0.5"  -- chorus2
+      ]
+      [ s "conga:12" # lvl 0.6  -- intro
+      , s "conga:12" # lvl 0.65  -- chorus
+      , s "conga:20" # verb 0.6 # lvl 0.6  -- breakdown
+      , s "conga:5" # lvl 0.65  -- buildup
+      , s "conga:12" # verb 0.2 # lvl 0.65  -- chorus2
+      ]
+  , hatT = Track
+      [ velocity "[0.5 0.25 0.35]*4"  -- intro
+      , velocity "[0.6 0.3 0.4]*4"  -- chorus
+      , velocity "[0.4 ~ 0.25]*4"  -- breakdown
+      , velocity "[0.6 0.3 0.4]*4"  -- buildup
+      , velocity "[0.6 0.3 0.45]*4"  -- chorus2
+      ]
+      [ s "shaker_large" # lvl 0.4  -- intro
+      , s "shaker_large" # lvl 0.45  -- chorus
+      , s "shaker_small" # verb 0.4 # lvl 0.35  -- breakdown
+      , s "shaker_large:2" # lvl 0.45  -- buildup
+      , pan (sway 0.35 0.65 1) # s "shaker_large" # lvl 0.45  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "1 ~ 1 ~ 1 1 ~ 1 ~ 1 ~ 1"  -- intro
+      , velocity "1 ~ 1 ~ 1 1 ~ 1 ~ 1 ~ 1"  -- chorus
+      , velocity "1 ~ 1 ~ 1 1 ~ 1 ~ 1 ~ 1"  -- breakdown
+      , velocity "1 ~ 1 ~ 1 1 ~ 1 ~ 1 ~ 1"  -- buildup
+      , velocity "1 ~ 1 ~ 1 1 ~ 1 ~ 1 ~ 1"  -- chorus2
+      ]
+      [ s "agogo" # lvl 0.45  -- intro
+      , s "agogo:1" # lvl 0.5  -- chorus
+      , s "agogo" # verb 0.5 # lvl 0.45  -- breakdown
+      , s "cowbell:4" # lvl 0.45  -- buildup
+      , s "agogo:2" # pan 0.6 # lvl 0.5  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , n "<[7 ~ ~ 9 ~ ~ 11 ~ 9 7 ~ ~] [10 ~ ~ 9 ~ ~ 8 ~ ~ 7 ~ ~] [11 ~ ~ 10 ~ ~ 9 ~ 8 7 ~ ~] [7 ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~]>" # velocity 0.75  -- chorus
+      , n "<[4@6 2@6] [3@12] [4@6 6@6] [7@12]>" # velocity 0.6  -- breakdown
+      , n ("[0 2 4]*4" |+ pwRoots) # velocity "0.8 0.5 0.6"  -- buildup
+      , n "<[14 ~ ~ 16 ~ ~ 18 ~ 16 14 ~ ~] [17 ~ ~ 16 ~ ~ 15 ~ ~ 14 ~ ~] [18 ~ ~ 17 ~ ~ 16 ~ 15 14 ~ ~] [14 ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~]>" # velocity 0.75  -- chorus2
+      ]
+      [ s "mm_brass" # mtone 0.7 # mrel 0.4 # lvl 0.45  -- intro
+      , s "mm_brass" # mtone 0.7 # mrel 0.4 # verb 0.3 # lvl 0.5  -- chorus
+      , s "mm_reed" # mtone 0.8 # matt 0.05 # mrel 0.5 # verb 0.5 # lvl 0.5  -- breakdown
+      , s "mm_brass" # mtone 0.6 # mrel 0.4 # lvl 0.45  -- buildup
+      , s "mm_brass" # mtone 0.6 # mrel 0.4 # verb 0.35 # lvl 0.5  -- chorus2
+      ]
+  , chordsT = Track
+      [ arp "updown" (segment 3 (n pwProg)) # velocity 0.6  -- intro
+      , arp "updown" (segment 3 (n pwProg)) # velocity 0.65  -- chorus
+      , arp "up" (segment 2 (n pwProg)) # velocity 0.55  -- breakdown
+      , arp "updown" (segment 3 (n pwProg)) # velocity 0.65  -- buildup
+      , arp "pinkyup" (segment 3 (n pwProg)) # velocity 0.65  -- chorus2
+      ]
+      [ s "mm_pluck" # mtone 0.6 # mrel 0.3 # lvl 0.5  -- intro
+      , s "mm_pluck" # mtone 0.6 # mrel 0.3 # verb 0.25 # lvl 0.55  -- chorus
+      , s "mm_pluck" # mtone 0.6 # mrel 0.3 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # verb 0.5 # lvl 0.5  -- breakdown
+      , s "mm_pluck" # mtone 0.75 # mrel 0.3 # lvl 0.55  -- buildup
+      , pan (sway 0.3 0.7 2) # s "mm_pluck" # mtone 0.6 # mrel 0.3 # verb 0.25 # lvl 0.55  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("<~ ~ ~ ~ [0 ~ ~ 4 ~ ~ 2 ~ 4 0 ~ ~]!4>" |+ pwRoots)  -- intro
+      , n ("0 ~ ~ 4 ~ ~ 2 ~ 4 0 ~ ~" |+ pwRoots) # velocity 0.85  -- chorus
+      , n pwRoots # velocity 0.6  -- breakdown
+      , n ("0 ~ 0 4 ~ 4 2 ~ 2 0 ~ 0" |+ pwRoots) # velocity 0.85  -- buildup
+      , n ("0 ~ ~ 4 ~ ~ 2 ~ 4 0 ~ -1" |+ pwRoots) # velocity 0.85  -- chorus2
+      ]
+      [ s "mm_bass" # mtone 0.4 # mrel 0.3 # lvl 0.7  -- intro
+      , s "mm_bass" # mtone 0.4 # mrel 0.3 # lvl 0.75  -- chorus
+      , s "mm_bass" # mtone 0.2 # mrel 0.3 # verb 0.3 # lvl 0.7  -- breakdown
+      , s "mm_bass" # mtone 0.7 # mrel 0.3 # lvl 0.7  -- buildup
+      , s "mm_bass" # mtone 0.4 # mrel 0.3 # lvl 0.75  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG 19: "scrapyard"  --  junkyard march: a lopsided, swung oom-pah
+--  played on found objects (cajon box, brake drum, anvil, ratchet,
+--  slapstick, vibraslap, flexatone), a bottle flute, hammered dulcimer,
+--  and a bass made from a clean guitar sample (Dirt-Samples on GitHub)
+--  pitched down.   Sweet spot 90-120 BPM.   Progression: i - i - iv - v
+-- ---------------------------------------------------------------------
+syProg :: Pattern Note
+syProg = "<[0,2,4] [0,2,4] [-4,-2,0] [-3,-1,1]>"
+syRoots :: Pattern Note
+syRoots = "<0 0 -4 -3>"
+scrapyard :: Song
+scrapyard = Song
+  { songName = "scrapyard"
+  , kickT = Track
+      [ velocity "<~ ~ ~ ~ [1 ~ 1 ~]!4>"  -- intro
+      , velocity "1 ~ 1 ~"  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity "<[1 ~ 1 ~]!4 [1 1 1 1]!2 [1 1 [1 1] [1 1]] [1*8]>"  -- buildup
+      , swingBy (1/6) 4 (velocity "1 ~ 1 [~ 0.6]")  -- chorus2
+      ]
+      [ s "cajon" # lpf 1200 # lvl 0.9  -- intro
+      , s "cajon" # lvl 0.9  -- chorus
+      , s "cajon:3" # verb 0.6 # lvl 0.85  -- breakdown
+      , s "cajon" # lvl 0.9  -- buildup
+      , s "bassdrum2:6" # lpf 700 # crush 6 # lvl 0.8  -- chorus2
+      ]
+  , snareT = Track
+      [ velocity "<~ ~ ~ ~ [~ 1 ~ 1]!4>"  -- intro
+      , velocity "~ 1 ~ 1"  -- chorus
+      , velocity "<~ ~ [~ ~ ~ 1] ~>"  -- breakdown
+      , velocity "<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8]!2>"  -- buildup
+      , swingBy (1/6) 4 (velocity "~ 1 ~ [1 0.5]")  -- chorus2
+      ]
+      [ s "brakedrum" # lvl 0.55  -- intro
+      , s "brakedrum:2" # lvl 0.6  -- chorus
+      , s "brakedrum:4" # verb 0.7 # lvl 0.5  -- breakdown
+      , s "anvil" # lvl 0.5  -- buildup
+      , s "anvil:2" # verb 0.3 # lvl 0.55  -- chorus2
+      ]
+  , hatT = Track
+      [ swingBy (1/6) 4 (velocity "[0.6 0.4]*4")  -- intro
+      , swingBy (1/6) 4 (velocity "[0.6 0.4]*4")  -- chorus
+      , swingBy (1/6) 4 (velocity "[~ 0.4]*4")  -- breakdown
+      , swingBy (1/6) 8 (velocity "[0.6 0.4 0.5 0.4]*4")  -- buildup
+      , swingBy (1/6) 4 (velocity "[0.6 0.4]*4")  -- chorus2
+      ]
+      [ s "sleighbells" # lvl 0.35  -- intro
+      , s "sleighbells:2" # lvl 0.4  -- chorus
+      , s "ratchet" # legato 0.5 # verb 0.5 # lvl 0.35  -- breakdown
+      , s "sleighbells" # lvl 0.4  -- buildup
+      , pan (sway 0.3 0.7 2) # s "sleighbells:2" # lvl 0.4  -- chorus2
+      ]
+  , percT = Track
+      [ velocity "<[~ ~ 1 ~] ~ [~ 1 ~ ~] ~>"  -- intro
+      , swingBy (1/6) 4 (velocity "[~ ~ 1 ~] [~ 1 ~ ~] [~ ~ ~ 1] [~ 1 ~ ~]")  -- chorus
+      , velocity "<1 ~ ~ ~>"  -- breakdown
+      , velocity ("[~ 1]*4" |* (ramp "buildup" 0.4 1))  -- buildup
+      , swingBy (1/6) 4 (velocity "[~ ~ 1 ~] [~ 1 ~ 1] [~ ~ ~ 1] [1 1 ~ ~]")  -- chorus2
+      ]
+      [ s "slapstick" # lvl 0.45  -- intro
+      , s "vibraslap" # lvl 0.45  -- chorus
+      , s "flexatone" # verb 0.6 # lvl 0.45  -- breakdown
+      , s "ratchet" # legato 0.5 # lvl 0.45  -- buildup
+      , s "slapstick:2" # lvl 0.45  -- chorus2
+      ]
+  , leadT = Track
+      [ silence  -- intro
+      , swingBy (1/6) 4 (n "<[4 ~ 2 4 ~ ~ 7 ~] [6@4 4 ~ 2 ~] [5 ~ 4 2 ~ ~ 0 ~] [1@6 ~ ~]>") # velocity 0.7  -- chorus
+      , n "<[7@6 ~ ~] [6@6 ~ ~] [5@6 ~ ~] [4@6 ~ ~]>" # velocity 0.55  -- breakdown
+      , swingBy (1/6) 4 (n ("[0 2 4 2]*2" |+ "<0 0 0 0 2 2 4 4>")) # velocity 0.6  -- buildup
+      , swingBy (1/6) 4 (n "<[11 ~ 9 11 ~ ~ 14 ~] [13@4 11 ~ 9 ~] [12 ~ 11 9 ~ ~ 7 ~] [8@6 ~ ~]>") # velocity 0.7  -- chorus2
+      ]
+      [ s "mm_flute" # mtone 1 # mrel 0.4 # lvl 0.5  -- intro
+      , s "mm_flute" # mtone 1 # mrel 0.4 # verb 0.4 # lvl 0.55  -- chorus
+      , s "mm_flute" # mtone 0 # mrel 0.4 # verb 0.7 # lvl 0.4  -- breakdown
+      , s "mm_mallet" # mtone 0.6 # mrel 0.3 # lvl 0.6  -- buildup
+      , s "mm_flute" # mtone 0 # mrel 0.4 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # verb 0.4 # lvl 0.4  -- chorus2
+      ]
+  , chordsT = Track
+      [ struct "~ t ~ t" (n syProg) # velocity 0.55  -- intro
+      , swingBy (1/6) 4 (struct "~ t ~ t" (n syProg)) # velocity 0.6  -- chorus
+      , n syProg # velocity 0.5  -- breakdown
+      , swingBy (1/6) 4 (struct "[~ t]*4" (n syProg)) # velocity 0.55  -- buildup
+      , swingBy (1/6) 4 (struct "~ t ~ [t t]" (n syProg)) # velocity 0.6  -- chorus2
+      ]
+      [ s "mm_pluck" # mtone 0.85 # mrel 0.3 # lvl 0.5  -- intro
+      , s "mm_pluck" # mtone 0.85 # mrel 0.3 # verb 0.3 # lvl 0.55  -- chorus
+      , s "mm_reed" # mtone 0.6 # matt 0.2 # mrel 1 # verb 0.5 # lvl 0.45  -- breakdown
+      , s "mm_pluck" # mtone 0.9 # mrel 0.3 # lvl 0.55  -- buildup
+      , s "mm_reed" # mtone 0.6 # mrel 0.4 # mdec 0.2 # mlev 0.4 # verb 0.3 # lvl 0.45  -- chorus2
+      ]
+  , bassT = Track
+      [ n ("<~ ~ ~ ~ [0 ~ 4 ~]!4>" |+ syRoots)  -- intro
+      , n ("0 4 0 4" |+ syRoots) # velocity 0.85  -- chorus
+      , n syRoots # velocity 0.6  -- breakdown
+      , n ("[0 4]*4" |+ syRoots) # velocity 0.8  -- buildup
+      , swingBy (1/6) 4 (n ("0 4 0 [4 2]" |+ syRoots)) # velocity 0.85  -- chorus2
+      ]
+      [ s "ds_gtr" # basepitch 48 # legato 1 # lpf 1500 # lvl 0.75  -- intro
+      , s "ds_gtr" # basepitch 48 # legato 1 # lpf 2000 # lvl 0.8  -- chorus
+      , s "ds_gtr" # basepitch 48 # legato 1 # lpf 900 # verb 0.5 # lvl 0.7  -- breakdown
+      , s "ds_gtr" # basepitch 48 # legato 0.6 # lvl 0.8  -- buildup
+      , s "ds_gtr" # basepitch 48 # legato 1 # shape 0.2 # lvl 0.75  -- chorus2
+      ]
+  }
+
+-- ---------------------------------------------------------------------
+--  SONG INDEX  --  list position = the song number a knob selects
+--   #  name         style                              sweet-spot BPM
+--   0  acid         acid techno                        125-135
+--   1  dusk         half-time broken beat              120-130
+--   2  glitter      hyperpop          (GitHub pack)    140-160
+--   3  twostep      UK garage 2-step  (GitHub pack)    130-136
+--   4  amen         atmospheric jungle (breakbeat)     150-170
+--   5  roots        dub reggae, delay automation        75-90
+--   6  mirrorball   disco                              116-126
+--   7  rotterdam    gabber / hardcore                  160-180
+--   8  tundra       ambient, automation study           80-100
+--   9  glacier      dark trap                          130-150
+--  10  neon         synthwave                          100-120
+--  11  shards       IDM / glitch, rhythm automation    110-140
+--  12  eightbit     chiptune                           130-160
+--  13  autobahn     kosmische / Berlin school          110-130
+--  14  robots       electro, talking vowel lead        120-130
+--  15  caju         bossa nova, acoustic               120-140
+--  16  pulse        chamber minimalism, acoustic       100-130
+--  17  kotekan      gamelan-inspired                   110-140
+--  18  palmwine     highlife in 12/8                   100-120
+--  19  scrapyard    junkyard march                      90-120
+-- ---------------------------------------------------------------------
+songs :: [Song]
+songs =
+  [ acid, dusk, glitter, twostep, amen, roots, mirrorball, rotterdam, tundra, glacier
+  , neon, shards, eightbit, autobahn, robots, caju, chamber, kotekan, palmwine, scrapyard ]
+
+
+-- =====================================================================
+--  3. ENGINE  --  no need to edit unless extending the instrument
+-- =====================================================================
+
+trackDefs :: [(String, Song -> Track, Bool)]
+trackDefs =
+  [ ("kick", kickT, False), ("snare", snareT, False), ("hat", hatT, False), ("perc", percT, False)
+  , ("lead", leadT, True), ("chords", chordsT, True), ("bass", bassT, True) ]
+
+-- ---- authoring checks: evaluate the line below the definition ----------
+checkSongs :: [String]
+checkSongs = concat [checkTrack i sg tr | (i, sg) <- zip [0 :: Int ..] songs, tr <- trackDefs]
+  where
+    checkTrack i sg (tn, getT, melodic) =
+      let tr = getT sg
+          who = "song " ++ show i ++ " (" ++ songName sg ++ ") " ++ tn
+      in  lenErr who "pattern" (pats tr) ++ lenErr who "timbre" (tims tr)
+          ++ concat (zipWith (entryErr who "pattern" melodic) sectionNames (pats tr))
+          ++ concat (zipWith (entryErr who "timbre" melodic) sectionNames (tims tr))
+    lenErr who part xs = [who ++ "." ++ part ++ " needs 5 entries, one per section" | length xs /= 5]
+    entryErr who part melodic sec p =
+      let vms = map value (queryArc p (Arc 0 8))
+          keys = concatMap Map.keys vms
+          at = who ++ "." ++ part ++ " [" ++ sec ++ "]"
+          forbidden
+            | part == "pattern" && melodic = ["gain", "note", "s"]
+            | part == "pattern" = ["gain", "note", "n", "s"]
+            | melodic = ["n", "note", "velocity"]
+            | otherwise = ["velocity"]
+      in  [at ++ " must not set " ++ k | k <- forbidden, k `elem` keys]
+          ++ [at ++ ": melodic patterns need n (scale degrees)" | part == "pattern", melodic, any (Map.notMember "n") vms]
+          ++ [at ++ ": drum timbres must name a sound with s" | part == "timbre", not melodic, any (Map.notMember "s") vms]
+
+mapM_ putStrLn (if null checkSongs then ["Mix-Matrix: all " ++ show (length songs) ++ " songs OK"] else checkSongs)
+
+-- ---- small helpers -------------------------------------------------------
+lookupCfg :: String -> [(String, a)] -> a
+lookupCfg k xs = fromMaybe (error ("Mix-Matrix: CONFIG has no entry for " ++ k)) (lookup k xs)
+pitchClass :: String -> Int
+pitchClass nm = fromMaybe (error ("Mix-Matrix: unknown rootNote " ++ nm)) (lookup nm table)
+  where
+    table = [ ("c", 0), ("c#", 1), ("db", 1), ("d", 2), ("d#", 3), ("eb", 3), ("e", 4), ("f", 5), ("f#", 6)
+            , ("gb", 6), ("g", 7), ("g#", 8), ("ab", 8), ("a", 9), ("a#", 10), ("bb", 10), ("b", 11) ]
+clampI :: Int -> Int -> Int
+clampI count i = max 0 (min (count - 1) i)
+toIdx :: Int -> Double -> Int
+toIdx count k = clampI count (round (k * fromIntegral (count - 1)))
+idxPos :: Int -> Int -> Double
+idxPos count i = if count <= 1 then 0 else fromIntegral (clampI count i) / fromIntegral (count - 1)
+rangePos :: (Double, Double) -> Double -> Double
+rangePos (lo, hi) x = (x - lo) / (hi - lo)
+snapTo :: Double -> Double -> Double
+snapTo step x = if step > 0 then fromIntegral (round (x / step) :: Int) * step else x
+numVal :: Value -> Maybe Double
+numVal (VN x) = Just (unNote x)
+numVal (VF x) = Just x
+numVal (VI x) = Just (fromIntegral x)
+numVal (VR x) = Just (fromRational x)
+numVal _ = Nothing
+
+-- ---- knobs ---------------------------------------------------------------
+-- The bridge sends each knob as 0..1. Until a knob is moved, cF returns the
+-- default position, so every control starts at its CONFIG default.
+knob :: String -> Double -> Pattern Double
+knob ccName dflt = if useMidi then cF dflt ccName else pure dflt
+
+-- Per-bar latch. A controller value is re-read on every scheduler query,
+-- so `segment 1` alone would still switch mid-bar; this keeps the value
+-- read when the scheduler first reaches each bar, for the whole bar.
+latchStore <- newIORef (Map.empty :: Map.Map (String, Int) Double)
+
+holdPerBar :: String -> Pattern Double -> Pattern Double
+holdPerBar key p = withEvent hold1 (segment 1 p)
+  where
+    hold1 e = e { value = unsafePerformIO (latch (barOf e) (value e)) }
+    barOf e = maybe 0 (floor . start) (whole e)
+    latch bar v = atomicModifyIORef' latchStore $ \m ->
+      case Map.lookup (key, bar) m of
+        Just held -> (m, held)
+        Nothing -> (Map.insert (key, bar) v (Map.filterWithKey (\(k, b) _ -> k /= key || abs (b - bar) <= 2) m), v)
+
+nSongs :: Int
+nSongs = length songs
+songKnob :: String -> String -> Int -> Pattern Int
+songKnob key ccName dflt = toIdx nSongs <$> latchIf (knob ccName (idxPos nSongs dflt))
+  where latchIf = if quantizeSongs then holdPerBar key else id
+keyPat :: Pattern Double
+keyPat = toKey <$> latchIf (knob ccKey (rangePos keyRange defKey))
+  where
+    latchIf = if quantizeKey then holdPerBar "key" else id
+    toKey k = fromIntegral (round (fst keyRange + k * (snd keyRange - fst keyRange)) :: Int)
+modePat :: Pattern String
+modePat = (\k -> modes !! toIdx (length modes) k) <$> latchIf (knob ccMode (idxPos (length modes) defIdx))
+  where
+    latchIf = if quantizeMode then holdPerBar "mode" else id
+    defIdx = fromMaybe 0 (lookup defMode (zip modes [0 ..]))
+bpmPat :: Pattern Double
+bpmPat = (\k -> snapTo bpmStep (fst bpmRange + k * (snd bpmRange - fst bpmRange))) <$> knob ccBpm (rangePos bpmRange defBpm)
+
+-- ---- timeline and selection ------------------------------------------------
+-- pickP keeps absolute time (innerJoin), so a newly chosen song enters in
+-- step with the shared timeline, and only the chosen song is ever queried.
+sectionIdx :: Pattern Int
+sectionIdx = _slow 64 "0@8 1@16 2@16 3@8 4@16"
+pickP :: Pattern Int -> [Pattern a] -> Pattern a
+pickP sel ps = innerJoin ((\i -> ps !! clampI (length ps) i) <$> sel)
+bySection :: [Pattern a] -> Pattern a
+bySection = pickP sectionIdx
+
+-- ---- pitch: scale degrees -> notes ---------------------------------------
+-- Mode and key are read per note. Sampled instruments carry basepitch
+-- (their recorded pitch); synths are tuned to MIDI 60 = note 0.
+degreeSemis :: String -> Int -> Double
+degreeSemis name d = (sc !! (d `mod` len)) + 12 * fromIntegral (d `div` len)
+  where
+    sc = fromMaybe [0, 2, 3, 5, 7, 8, 10] (lookup name scaleTable)
+    len = length sc
+toPitch :: Double -> ControlPattern -> ControlPattern
+toPitch rootMidi cp = convert <$> cp <* modePat <* keyPat
+  where
+    convert vm m k = case Map.lookup "n" vm >>= numVal of
+      Nothing -> vm
+      Just d ->
+        let base = fromMaybe 60 (Map.lookup "basepitch" vm >>= numVal)
+            midi = rootMidi + degreeSemis m (round d) + k
+        in  Map.insert "note" (VN (Note (midi - base))) (Map.delete "n" (Map.delete "basepitch" vm))
+
+-- velocity (accents) becomes SuperDirt's linear amp (default 0.4)
+finalize :: ControlPattern -> ControlPattern
+finalize = fmap toAmp
+  where
+    toAmp vm = case Map.lookup "velocity" vm >>= numVal of
+      Just v -> Map.insert "amp" (VF (0.4 * v)) (Map.delete "velocity" vm)
+      Nothing -> vm
+
+-- mm_* synths: tell the synth the note length (mhold) and keep SuperDirt from
+-- cutting the release tail by extending sustain by the release time.
+addTails :: ControlPattern -> ControlPattern
+addTails = withEvent extend
+  where
+    extend e = case (whole e, Map.lookup "cps" (value e) >>= numVal, Map.lookup "s" (value e)) of
+      (Just (Arc a b), Just c, Just (VS name)) | c > 0 && take 3 name == "mm_" ->
+        let vm = value e
+            leg = fromMaybe 1 (Map.lookup "legato" vm >>= numVal)
+            noteLen = fromRational (b - a) / c * leg
+            rel = fromMaybe 0.1 (Map.lookup "mrel" vm >>= numVal)
+        in  e { value = Map.insert "mhold" (VF noteLen) (Map.insert "sustain" (VF (noteLen + rel)) vm) }
+      _ -> e
+
+-- ---- tracks and mix --------------------------------------------------------
+buildTrack :: Int -> (String, Song -> Track, Bool) -> ControlPattern
+buildTrack orb (name, getT, melodic) = finalize pitched # orbit (pure orb)
+  where
+    patSel = songKnob (name ++ ".pattern") (lookupCfg name ccPattern) (lookupCfg name defPattern)
+    timSel = songKnob (name ++ ".timbre") (lookupCfg name ccTimbre) (lookupCfg name defTimbre)
+    patP = pickP patSel [bySection (pats (getT sg)) | sg <- songs]
+    merged = pickP timSel [patP # bySection (tims (getT sg)) | sg <- songs]
+    pitched = if melodic then toPitch rootMidi merged else merged
+    rootMidi = fromIntegral (pitchClass rootNote + 12 * (lookupCfg name octaves + 1))
+
+mixMatrix :: ControlPattern
+mixMatrix = addTails (stack (zipWith buildTrack [0 ..] trackDefs) # cps ((/ 240) <$> bpmPat))
+
+
+-- =====================================================================
+--  4. OUTPUT
+-- =====================================================================
+d1 $ mixMatrix
+
+-- stop:   hush
