@@ -17,5 +17,15 @@ d3 $ n "0 ~ 3 5 ~ 7 ~ 5" # sound "superpiano" # octave 3 # legato 0.5
 -- a little variation
 d1 $ every 4 (fast 2) $ sound "bd*2 [~ bd] sn ~" # room 0.3
 
+-- MIDI low pass filter (DDJ-FLX6 filter knob: MIDI channel 7, CC 25)
+-- Sweeps cutoff 100 Hz - 10 kHz exponentially; default 1 keeps it open until moved.
+d3 $ n "0 ~ 3 5 ~ 7 ~ 5" # sound "superpiano" # octave 3 # legato 0.5
+   # lpf (rangex 100 10000 $ cF 1 "ch7cc25")
+   # resonance 1.5
+
+-- same filter across drums and hats
+d1 $ sound "bd*2 [~ bd] sn ~" # lpf (rangex 100 10000 $ cF 1 "ch7cc25")
+d2 $ sound "hh*8" # gain 0.8 # pan sine # lpf (rangex 100 10000 $ cF 1 "ch7cc25")
+
 -- silence everything
 hush
