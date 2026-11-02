@@ -26,8 +26,9 @@ instance Tidally where tidal = tidalInst
 
 -- :runblocks [file]  evaluates a .tidal file block by block (blocks are
 -- separated by blank lines), as if you pressed Ctrl+Enter on each one in order.
--- Without a file it runs main.tidal. Comment-only blocks and blocks that start
--- with a GHCi command (like the :runblocks line itself) are skipped.
+-- Without a file it runs main.tidal. Comment-only blocks, a block that is just
+-- hush, and blocks that start with a GHCi command (like the :runblocks line
+-- itself) are skipped.
 import qualified Data.Char
 :{
 runBlocksScript :: String -> String
@@ -38,8 +39,10 @@ runBlocksScript src = unlines (concatMap wrap (filter runnable (blocks (lines (f
       [] -> []
       xs -> let (b, rest) = break blank xs in b : blocks rest
     isComment l = take 2 (dropWhile Data.Char.isSpace l) == "--"
+    trim = reverse . dropWhile Data.Char.isSpace . reverse . dropWhile Data.Char.isSpace
     runnable b = case filter (not . isComment) b of
       [] -> False
+      [l] | trim l == "hush" -> False
       (l : _) -> take 1 (dropWhile Data.Char.isSpace l) /= ":"
     wrap b = [":{"] ++ b ++ [":}"]
 :}

@@ -12,8 +12,8 @@ prefix keeps the original sample order, so "conga:12" picks the same file as
 it did in Strudel.
 
 Usage:   python3 fetch_mixmatrix_samples.py [target folder]
-Needs Python 3.8+, no extra packages. If ffmpeg is installed, MP3/OGG files
-are converted to WAV (older SuperCollider builds cannot read MP3).
+Needs Python 3.8+, no extra packages. If ffmpeg is installed, MP3/OGG/FLAC
+files are converted to WAV (SuperDirt only loads WAV and AIFF).
 Re-running skips files that are already there.
 """
 import concurrent.futures as cf
@@ -36,6 +36,8 @@ HYPERPOP = 'https://raw.githubusercontent.com/itsaandy/strudel-samples/main/hype
 UKG = 'https://raw.githubusercontent.com/itsaandy/strudel-samples/main/ukg/'
 FRETLESS = 'https://raw.githubusercontent.com/cleary/samples-flbass/main/'
 DIRT = 'https://raw.githubusercontent.com/tidalcycles/Dirt-Samples/master/'
+AMEN160 = 'https://raw.githubusercontent.com/Durmiente/amen_breaks_160/main/'
+AMENOG = 'https://raw.githubusercontent.com/cassette-tape/amen/main/'
 
 # Sounds the Strudel version mapped by hand from GitHub repos (same files, same order)
 EXPLICIT = {
@@ -62,6 +64,12 @@ EXPLICIT = {
                          'moog/006_Mighty%20Moog%20G4.wav']),
     'ds_gtr':    (DIRT, ['gtr/0001_cleanC.wav']),
     'ds_rave':   (DIRT, ['rave/AREUREADY.wav']),
+    # amen breaks at 160 BPM (used by the "amen" song); 0 is the clean altamira
+    'am_break':  (AMEN160, ['ALTAMIRA_CLEAN.wav', 'ALTAMIRA.WAV', 'APOTHE~1.WAV', 'ASTEROID.WAV',
+                            'BETABA~1.WAV', 'CHASSE.WAV', 'CLEVER~1.WAV']),
+    # the original amen break (MP3, converted to WAV when ffmpeg is installed);
+    # slice_amen.py cuts it into am_slice afterwards
+    'am_og':     (AMENOG, ['amen_break_og.mp3']),
 }
 
 # Every sample folder the songs use that SuperDirt's own Dirt-Samples lacks
@@ -119,6 +127,8 @@ NEEDED = [
     "RolandTR909_rim",
     "RolandTR909_sd",
     "agogo",
+    "am_break",
+    "am_og",
     "anvil",
     "bassdrum1",
     "bassdrum2",
@@ -230,7 +240,7 @@ def save(job):
         return 'skip'
     with open(original, 'wb') as fh:
         fh.write(fetch(url))
-    if ffmpeg and ext.lower() in ('.mp3', '.ogg'):
+    if ffmpeg and ext.lower() in ('.mp3', '.ogg', '.flac'):
         done = subprocess.run([ffmpeg, '-loglevel', 'quiet', '-y', '-i', original, wav],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if done.returncode == 0:
@@ -271,14 +281,14 @@ def main():
                 failed.append((futures[fut][2], err))
     print('done: %d downloaded, %d already present, %d failed' % (counts['new'] + counts['kept'], counts['skip'], len(failed)))
     if counts['kept']:
-        print('note: %d MP3/OGG files could not be converted and were kept as they are' % counts['kept'])
+        print('note: %d MP3/OGG/FLAC files could not be converted and were kept as they are' % counts['kept'])
     for url, err in failed[:20]:
         print('  failed:', url, '-', err)
     if missing:
         print('not found in any sample map (these sounds will be silent):', ', '.join(missing))
     if not ffmpeg:
-        print('note: ffmpeg not found, so any MP3 files were kept as MP3; if SuperDirt cannot load '
-              'them, install ffmpeg and run this script again.')
+        print('note: ffmpeg not found, so MP3/OGG/FLAC files were kept as they are; SuperDirt cannot load '
+              'them, so install ffmpeg and run this script again.')
 
 
 if __name__ == '__main__':

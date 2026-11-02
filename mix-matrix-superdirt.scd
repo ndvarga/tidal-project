@@ -171,7 +171,7 @@ MIDIClient.sources.do { |src|
 // ~mmMidiPost = true prints each knob move as the name to use in cF, e.g.
 //   MIDI ch7cc25 = 0.984  (val 125)
 // Set it to false (and re-run this block) once you have found your knobs.
-~mmMidiPost = true;
+~mmMidiPost = false;
 MIDIdef.cc(\mixMatrixCC, { |val, num, chan|
 	if (~mmMidiChannel.isNil or: { chan == ~mmMidiChannel }) {
 		~mmTidal.sendMsg("/ctrl", "cc" ++ num, val / 127);

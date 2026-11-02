@@ -139,20 +139,36 @@ swell lo hi = _slow 64 (range (pure hi) (pure lo) cosine)
 -- False: every control uses the defaults below (audition without hardware).
 -- With MIDI on, a knob also uses its default until it is first moved.
 useMidi :: Bool
-useMidi = False
+useMidi = True
+
+-- True: print each MIDI change in the Tidal output, e.g.
+--   MIDI lead.timbre (ch3cc15): song 3 (shards)
+-- (see 5. MIDI MONITOR at the end of the file)
+monitorMidi :: Bool
+monitorMidi = True
 
 -- MIDI controls, named like the bridge sends them  --  PLACEHOLDERS, EDIT ME
--- "cc<number>" from any channel, or "ch<channel>cc<number>" for one channel.
+-- "ch<channel>cc<number>", channel counted from 1. Turn a knob with
+-- ~mmMidiPost on in mix-matrix-superdirt.scd and copy the name it prints.
+-- ccFilter is the low pass on the whole mix, applied in OUTPUT.
 ccPattern, ccTimbre :: [(String, String)]
-ccPattern = [("kick", "cc20"), ("snare", "cc21"), ("hat", "cc22"), ("perc", "cc23"), ("lead", "cc24"), ("chords", "cc25"), ("bass", "cc26")]
-ccTimbre = [("kick", "cc30"), ("snare", "cc31"), ("hat", "cc32"), ("perc", "cc33"), ("lead", "cc34"), ("chords", "cc35"), ("bass", "cc36")]
-ccKey, ccMode, ccBpm :: String
-ccKey = "cc40"
-ccMode = "cc41"
-ccBpm = "cc42"
+ccPattern = [("kick", "ch3cc4"), ("snare", "ch1cc4"), ("hat", "ch2cc4"), ("perc", "ch4cc4"), ("lead", "ch3cc7"), ("chords", "ch1cc7"), ("bass", "ch2cc7")]
+ccTimbre = [("kick", "ch3cc11"), ("snare", "ch1cc11"), ("hat", "ch2cc11"), ("perc", "ch4cc11"), ("lead", "ch3cc15"), ("chords", "ch1cc15"), ("bass", "ch2cc15")]
+ccKey, ccMode, ccBpm, ccFilter :: String
+ccKey = "ch1cc34"
+ccMode = "ch3cc19"
+ccBpm = "ch1cc0"
+ccFilter = "ch7cc25"
 -- To add a global control: add a CC here, a default below, build its
 -- pattern in ENGINE like keyPat (e.g. a master volume with knob ccMaster),
 -- and apply it to the mix in mixMatrix, e.g.  # amp (...)
+
+-- MIDI DEFS
+-- jog wheels == MODE, BPM
+-- FADERS: KICK DRUM, OTHER DRUMS,
+-- BPM SLIDER == TONIC Key
+-- CHANNEL KNOBS == PATTERN. TIMBRE
+
 
 -- Defaults: song numbers are positions in the songs list (0 = acid).
 -- Example blend: kick pattern from song 0 with song 7's kick sound.
@@ -179,6 +195,11 @@ octaves :: [(String, Int)]
 octaves = [("bass", 2), ("chords", 3), ("lead", 4)]
 modes :: [String]
 modes = ["minor", "dorian", "phrygian", "major", "mixolydian", "lydian"]
+
+-- Tracks where each new hit stops the previous sound (SuperDirt cut), so
+-- long samples played by a busy pattern don't pile up. [] = off.
+cutTracks :: [String]
+cutTracks = ["perc"]
 
 -- When knob changes take effect: True = next bar line, False = next note
 quantizeSongs, quantizeKey, quantizeMode :: Bool
@@ -576,16 +597,17 @@ twostep = Song
       ]
       [ s "ug_tops:1" # speed 0.94 # hpf 400 # lvl 0.55  -- intro
       , s "ug_tops:0" # speed 0.94 # lvl 0.6  -- chorus
-      , s "ug_vox:0" # verb 0.6 # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.4 # lvl 0.6  -- breakdown
+      , s "ug_vox:0" # verb 0.6 # lvl 0.6  -- breakdown
       , s "ug_fx:2" # lvl 0.6  -- buildup
       , s "ug_tops:0" # speed 0.94 # lvl 0.6  -- chorus2
       ]
   , leadT = Track
+      -- melody turned off; the original lines are kept for reference
       [ silence  -- intro
-      , n "<[~ 4 ~ ~ 4 ~ 2 ~] [~ ~ 4 ~ 6 ~ 4 ~] [~ 3 ~ ~ 3 ~ 1 ~] [~ 2 ~ 4 ~ ~ ~ ~]>" # velocity 0.8  -- chorus
-      , n "<[4@3 2] [4@4] [3@3 1] [2@4]>" # velocity 0.6  -- breakdown
-      , n ("[4 ~ 4 ~]*2" |+ "<0 0 1 1 2 2 3 4>") # velocity 0.7  -- buildup
-      , n "<[~ 7 ~ ~ 7 ~ 6 ~] [~ ~ 8 ~ 9 ~ 8 ~] [~ 6 ~ ~ 5 ~ 3 ~] [~ 4 ~ 6 ~ ~ ~ ~]>" # velocity 0.8  -- chorus2
+      , silence  -- chorus     was: n "<[~ 4 ~ ~ 4 ~ 2 ~] [~ ~ 4 ~ 6 ~ 4 ~] [~ 3 ~ ~ 3 ~ 1 ~] [~ 2 ~ 4 ~ ~ ~ ~]>" # velocity 0.8
+      , silence  -- breakdown  was: n "<[4@3 2] [4@4] [3@3 1] [2@4]>" # velocity 0.6
+      , silence  -- buildup    was: n ("[4 ~ 4 ~]*2" |+ "<0 0 1 1 2 2 3 4>") # velocity 0.7
+      , silence  -- chorus2    was: n "<[~ 7 ~ ~ 7 ~ 6 ~] [~ ~ 8 ~ 9 ~ 8 ~] [~ 6 ~ ~ 5 ~ 3 ~] [~ 4 ~ 6 ~ ~ ~ ~]>" # velocity 0.8
       ]
       [ s "mm_reed" # mtone 0.6 # mrel 0.4 # vowel "a" # lvl 0.5  -- intro
       , s "mm_reed" # mtone 0.6 # mrel 0.4 # vowel "a" # delay 0.3 # delaytime 0.1875 # lock 1 # delayfeedback 0.35 # verb 0.3 # lvl 0.5  -- chorus
@@ -622,16 +644,35 @@ twostep = Song
   }
 
 -- ---------------------------------------------------------------------
---  SONG 4: "amen"  --  atmospheric jungle: a sampled breakbeat stretched
---  to one bar and re-cut by the perc pattern, jungle snare, reese bass
---  with a wobbling filter, vibraphone and pads.
---  Sounds: breaks125 (built-in), jungle snare from the UKG pack.
+--  SONG 4: "amen"  --  atmospheric jungle: the original amen break cut into
+--  single hits and re-sequenced, breakcore snare rolls that rise in pitch,
+--  jungle snare, reese bass with a wobbling filter, vibraphone and pads.
+--  Sounds: am_slice (github.com/cassette-tape/amen, cut into 40 hits by
+--  slice_amen.py), jungle snare from the UKG pack.
 --  Sweet spot 150-170 BPM.   Progression: i7 - i7 - VImaj7 - VImaj7
 -- ---------------------------------------------------------------------
 amProg :: Pattern Note
 amProg = "<[0,2,4,6] [0,2,4,6] [-2,0,2,4] [-2,0,2,4]>"
 amRoots :: Pattern Note
 amRoots = "<0 0 -2 -2>"
+-- The 4-bar break as slices am_slice:0-39 (see the table slice_amen.py prints).
+-- amHits: where the original hits fall, one 16-step bar per bar.
+-- amSlices: the slice for each 16th; steps between hits re-chop the last hit.
+-- amFill: the same, with the last beat of bar 4 turned into the snare.
+-- amSnare: the cleanest snare hit, used for the rolls.
+amHits :: Pattern Double
+amHits = "<[1 1 1 ~ 1 ~ ~ 1 1 1 1 1 1 ~ ~ 1] [1 1 1 ~ 1 ~ ~ 1 1 1 1 1 1 ~ ~ 1] [1 1 1 1 1 ~ ~ 1 ~ 1 1 1 1 ~ 1 ~] [~ 1 1 1 1 ~ ~ 1 ~ ~ 1 ~ ~ ~ 1 ~]>"
+amSlices, amFill, amSnare :: Pattern Note
+amSlices = "<[0 1 2 2 3 3 3 4 5 6 7 8 9 9 9 10] [11 12 13 13 14 14 14 15 16 17 18 19 20 20 20 21] [22 23 24 25 26 26 26 27 27 28 29 30 31 31 32 32] [32 33 34 35 36 36 36 37 37 37 38 38 38 38 39 39]>"
+amFill = "<[0 1 2 2 3 3 3 4 5 6 7 8 9 9 9 10] [11 12 13 13 14 14 14 15 16 17 18 19 20 20 20 21] [22 23 24 25 26 26 26 27 27 28 29 30 31 31 32 32] [32 33 34 35 36 36 36 37 37 37 38 38 14 14 14 14]>"
+amSnare = 14
+-- amChop sp sl: play am_slice, taking the slice from sl and the pitch (speed)
+-- from sp; both are read every 32nd so they follow fast rolls.
+amChop :: Pattern Double -> Pattern Note -> ControlPattern
+amChop sp sl = speed (segment 32 sp) # n sl # s "am_slice"
+-- one bar of rising pitch, from speed a to speed b
+amRise :: Double -> Double -> Pattern Double
+amRise a b = range (pure a) (pure b) saw
 amen :: Song
 amen = Song
   { songName = "amen"
@@ -658,7 +699,8 @@ amen = Song
       [ s "ug_snare:1" # lvl 0.75  -- intro
       , s "ug_snare:1" # verb 0.2 # lvl 0.8  -- chorus
       , s "ug_snare:1" # verb 0.6 # lvl 0.7  -- breakdown
-      , speed (rampx "buildup" 1 1.6) # s "ug_snare:1" # lvl 0.75  -- buildup
+      -- buildup: the amen snare, each bar's roll rising in pitch, higher every bar
+      , amChop (slowcat [1, 1, amRise 1 1.15, amRise 1.1 1.3, amRise 1.25 1.55, amRise 1.4 1.85, amRise 1.6 2.3, amRise 1.9 3]) amSnare # lvl 0.75  -- buildup
       , s "ug_snare:1" # shape 0.15 # verb 0.2 # lvl 0.8  -- chorus2
       ]
   , hatT = Track
@@ -675,17 +717,17 @@ amen = Song
       , pan (sway 0.3 0.7 2) # s "RolandTR909_hh" # lvl 0.45  -- chorus2
       ]
   , percT = Track
-      [ velocity "<~ ~ ~ ~ 1 1 1 [1 ~ ~ ~ ~ ~ 1 ~]>"  -- intro
-      , velocity "<1 1 1 [1 ~ ~ ~ ~ ~ 1 ~]>"  -- chorus
+      [ mask "<f!4 t!4>" (velocity amHits)  -- intro: the break enters after 4 bars
+      , velocity amHits  -- chorus: the original break
       , silence  -- breakdown
-      , velocity "<1 1 1 1 [1 ~ 1 ~] [1 ~ 1 ~] [1 1 1 1] [1*8]>"  -- buildup
-      , velocity "<1 [1 ~ ~ ~ ~ ~ 1 ~] 1 [1 ~ ~ 1 ~ ~ 1 ~]>"  -- chorus2
+      , mask "<t!6 f!2>" (velocity amHits)  -- buildup: drops out for the snare roll
+      , velocity "<[1 1 1 ~ 1 ~ ~ 1 1 1 1 1 1 ~ ~ 1] [1 1 1 ~ 1 ~ ~ 1 1 1 1 1 1 ~ ~ 1] [1 1 1 1 1 ~ ~ 1 ~ 1 1 1 1 ~ 1 ~] [~ 1 1 1 1 ~ ~ 1 ~ ~ 1 ~ [0.5 0.6 0.7 0.8 0.85 0.9 0.95 1]@4]>"  -- chorus2: 32nd roll at the end of bar 4
       ]
-      [ s "breaks125" # lpf 900 # unit "c" # speed 1 # lvl 0.7  -- intro
-      , s "breaks125" # unit "c" # speed 1 # lvl 0.75  -- chorus
-      , s "breaks125" # lpf 600 # verb 0.5 # unit "c" # speed 1 # lvl 0.6  -- breakdown
-      , s "breaks125" # hpf (rampx "buildup" 60 2500) # unit "c" # speed 1 # lvl 0.75  -- buildup
-      , s "breaks125" # shape 0.2 # unit "c" # speed 1 # lvl 0.75  -- chorus2
+      [ amChop 1 amSlices # lpf 900 # lvl 0.7  -- intro
+      , amChop 1 amSlices # lvl 0.75  -- chorus
+      , amChop 1 amSlices # lpf 600 # verb 0.5 # lvl 0.6  -- breakdown
+      , hpf (rampx "buildup" 60 2500) # amChop 1 amSlices # lvl 0.75  -- buildup
+      , amChop "<1 1 1 [1@12 [1 1.15 1.3 1.45 1.6 1.75 1.9 2.05]@4]>" amFill # shape 0.2 # lvl 0.75  -- chorus2: the fill rises in pitch
       ]
   , leadT = Track
       [ silence  -- intro
@@ -717,7 +759,7 @@ amen = Song
       [ silence  -- intro
       , n "<[0@3 0] [0@2 -1 0] [-2@3 -2] [-2 ~ -3 -2]>" # velocity 0.9  -- chorus
       , n amRoots # velocity 0.7  -- breakdown
-      , n ("[0 ~ 0 ~]*2" |+ amRoots) # velocity 0.85  -- buildup
+      , n ("[0 ~ [0 3] ~]*2" |+ amRoots) # velocity 0.85  -- buildup
       , n "<[0@3 7] [0@2 -1 0] [-2@3 5] [-2 ~ -3 -1]>" # velocity 0.9  -- chorus2
       ]
       [ s "mm_saw" # lpf 400 # lvl 0.4  -- intro
@@ -762,10 +804,10 @@ roots = Song
       , velocity "<[~ ~ 1 ~]!3 [~ ~ 1 [1 0.6 0.4 0.3]]>"  -- chorus2
       ]
       [ s "AkaiMPC60_rim" # verb 0.5 # lvl 0.7  -- intro
-      , s "AkaiMPC60_rim" # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.4 # lvl 0.7  -- chorus
+      , s "AkaiMPC60_rim" # delay 0.25 # delaytime 0.1875 # lock 1 # delayfeedback 0.25 # verb 0.2 # lvl 0.7  -- chorus
       , delayfeedback (sway 0.5 0.8 8) # s "AkaiMPC60_sd" # delay 0.6 # delaytime 0.1875 # lock 1 # verb 0.6 # lvl 0.65  -- breakdown
       , s "AkaiMPC60_sd" # verb 0.3 # lvl 0.7  -- buildup
-      , delayfeedback (sway 0.35 0.75 4) # s "AkaiMPC60_rim" # delay 0.5 # delaytime 0.1875 # lock 1 # verb 0.4 # lvl 0.7  -- chorus2
+      , delayfeedback (sway 0.2 0.4 4) # s "AkaiMPC60_rim" # delay 0.3 # delaytime 0.1875 # lock 1 # verb 0.2 # lvl 0.7  -- chorus2
       ]
   , hatT = Track
       [ swingBy (1/6) 4 (velocity "[0.5 0.3]*4")  -- intro
@@ -795,10 +837,10 @@ roots = Song
       ]
   , leadT = Track
       [ silence  -- intro
-      , n "<[4 ~ ~ 4 2 ~ 0 ~] [2@4 ~ ~ ~ ~] [4 ~ ~ 4 5 ~ 4 ~] [2@3 ~ 0@2 ~ ~]>" # velocity 0.7  -- chorus
+      , n "<[4@3 ~ 2@2 ~ ~] [0@6 ~ ~] [4@3 ~ 5@2 ~ ~] ~ [4@3 ~ 2@2 ~ ~] [0@6 ~ ~] [3@3 ~ 0@4] ~>" # velocity 0.7  -- chorus
       , n "<[7@6 ~ ~] ~ [5@6 ~ ~] ~>" # velocity 0.6  -- breakdown
       , n ("[0 2 4 2]*2" |+ "<0 0 0 0 2 2 4 4>") # velocity 0.6  -- buildup
-      , n "<[7 ~ ~ 7 6 ~ 4 ~] [6@4 ~ ~ ~ ~] [5 ~ ~ 5 4 ~ 2 ~] [4@3 ~ 2@2 ~ ~]>" # velocity 0.7  -- chorus2
+      , n "<[7@3 ~ 4@2 ~ ~] [4@6 ~ ~] ~ [5@3 ~ 3@4] [7@3 ~ 9@2 ~ ~] [7@6 ~ ~] [5@3 ~ 4@2 ~ ~] ~>" # velocity 0.7  -- chorus2
       ]
       [ s "mm_reed" # mtone 0.4 # mrel 0.4 # lvl 0.45  -- intro
       , s "mm_reed" # mtone 0.4 # mrel 0.4 # delay 0.45 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.4 # lvl 0.45  -- chorus
@@ -1655,7 +1697,7 @@ autobahn = Song
       [ s "mm_flute" # mtone 0.4 # mrel 0.4 # lvl 0.45  -- intro
       , s "mm_flute" # mtone 0.4 # mrel 0.4 # delay 0.4 # delaytime 0.1875 # lock 1 # delayfeedback 0.45 # verb 0.5 # lvl 0.45  -- chorus
       , s "mm_flute" # mtone 0.7 # mrel 0.4 # verb 0.8 # lvl 0.45  -- breakdown
-      , lpf (rampx "buildup" 600 8000) # s "ds_moog:2" # basepitch 67 # legato 0.9 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.5  -- buildup
+      , lpf (rampx "buildup" 600 8000) # s "ds_moog" # basepitch 67 # legato 0.9 # delay 0.3 # delaytime 0.09375 # lock 1 # delayfeedback 0.4 # lvl 0.5  -- buildup
       , s "mm_flute" # mtone 0.4 # mrel 0.4 # delay 0.45 # delaytime 0.1875 # lock 1 # delayfeedback 0.5 # verb 0.5 # lvl 0.45  -- chorus2
       ]
   , chordsT = Track
@@ -1678,11 +1720,11 @@ autobahn = Song
       , n ("[0 0 7 0 3 0 7 5]*2" |+ abRoots) # velocity "[1 0.5 0.7 0.5]*4"  -- buildup
       , n ("[0 0 7 0 3 0 9 7]*2" |+ abRoots) # velocity "[1 0.5 0.7 0.5]*4"  -- chorus2
       ]
-      [ lpf (rampx "intro" 200 1500) # s "ds_moog:0" # basepitch 43 # legato 0.8 # lvl 0.6  -- intro
-      , lpf (sway 400 2400 8) # s "ds_moog:0" # basepitch 43 # legato 0.8 # resonance 0.17 # delay 0.2 # delaytime 0.1875 # lock 1 # delayfeedback 0.3 # lvl 0.6  -- chorus
-      , lpf (drift 300 1200 4) # s "ds_moog:0" # basepitch 43 # legato 0.9 # verb 0.5 # lvl 0.55  -- breakdown
-      , lpf (rampx "buildup" 300 6000) # s "ds_moog:0" # basepitch 43 # legato 0.7 # resonance 0.27 # lvl 0.6  -- buildup
-      , lpf (sway 500 3500 4) # pan (sway 0.3 0.7 2) # s "ds_moog:0" # basepitch 43 # legato 0.8 # resonance 0.2 # lvl 0.6  -- chorus2
+      [ lpf (rampx "intro" 200 1500) # s "ds_moog" # basepitch 43 # legato 0.8 # lvl 0.6  -- intro
+      , lpf (sway 400 2400 8) # s "ds_moog" # basepitch 43 # legato 0.8 # resonance 0.17 # delay 0.2 # delaytime 0.1875 # lock 1 # delayfeedback 0.3 # lvl 0.6  -- chorus
+      , lpf (drift 300 1200 4) # s "ds_moog" # basepitch 43 # legato 0.9 # verb 0.5 # lvl 0.55  -- breakdown
+      , lpf (rampx "buildup" 300 6000) # s "ds_moog" # basepitch 43 # legato 0.7 # resonance 0.27 # lvl 0.6  -- buildup
+      , lpf (sway 500 3500 4) # pan (sway 0.3 0.7 2) # s "ds_moog" # basepitch 43 # legato 0.8 # resonance 0.2 # lvl 0.6  -- chorus2
       ]
   }
 
@@ -1895,11 +1937,11 @@ caju = Song
       , n ("[0@3 4 4@3 0]" |+ cjRoots) # velocity 0.85  -- buildup
       , n ("<[0@3 4 4@3 0] [0@3 4 4 2 1 -1]>" |+ cjRoots) # velocity 0.85  -- chorus2
       ]
-      [ s "fl_bass:0" # basepitch 36 # legato 1 # lvl 0.8  -- intro
-      , s "fl_bass:0" # basepitch 36 # legato 1 # lvl 0.85  -- chorus
+      [ s "fl_bass" # basepitch 36 # legato 1 # lvl 0.8  -- intro
+      , s "fl_bass" # basepitch 36 # legato 1 # lvl 0.85  -- chorus
       , s "mm_bass" # mtone 0.1 # mrel 0.3 # verb 0.3 # lvl 0.7  -- breakdown
-      , s "fl_bass:0" # basepitch 36 # legato 1 # lvl 0.85  -- buildup
-      , s "fl_bass:0" # basepitch 36 # legato 1 # verb 0.2 # lvl 0.85  -- chorus2
+      , s "fl_bass" # basepitch 36 # legato 1 # lvl 0.85  -- buildup
+      , s "fl_bass" # basepitch 36 # legato 1 # verb 0.2 # lvl 0.85  -- chorus2
       ]
   }
 
@@ -2330,6 +2372,20 @@ scrapyard = Song
   }
 
 -- ---------------------------------------------------------------------
+--  SONG 20: "mute"  --  every track silent. Select it with a track's
+--  pattern or timbre knob (knob fully up) to mute just that track.
+--  (Named muteSong because Tidal already has a mute function.)
+-- ---------------------------------------------------------------------
+muteTrack :: Track
+muteTrack = Track (replicate 5 silence) (replicate 5 silence)
+muteSong :: Song
+muteSong = Song
+  { songName = "mute"
+  , kickT = muteTrack, snareT = muteTrack, hatT = muteTrack, percT = muteTrack
+  , leadT = muteTrack, chordsT = muteTrack, bassT = muteTrack
+  }
+
+-- ---------------------------------------------------------------------
 --  SONG INDEX  --  list position = the song number a knob selects
 --   #  name         style                              sweet-spot BPM
 --   0  acid         acid techno                        125-135
@@ -2352,11 +2408,13 @@ scrapyard = Song
 --  17  kotekan      gamelan-inspired                   110-140
 --  18  palmwine     highlife in 12/8                   100-120
 --  19  scrapyard    junkyard march                      90-120
+--  20  mute         silence: mutes the track it is selected for
 -- ---------------------------------------------------------------------
 songs :: [Song]
 songs =
   [ acid, dusk, glitter, twostep, amen, roots, mirrorball, rotterdam, tundra, glacier
-  , neon, shards, eightbit, autobahn, robots, caju, chamber, kotekan, palmwine, scrapyard ]
+  , neon, shards, eightbit, autobahn, robots, caju, chamber, kotekan, palmwine, scrapyard
+  , muteSong ]
 
 
 -- =====================================================================
@@ -2445,18 +2503,28 @@ nSongs = length songs
 songKnob :: String -> String -> Int -> Pattern Int
 songKnob key ccName dflt = toIdx nSongs <$> latchIf (knob ccName (idxPos nSongs dflt))
   where latchIf = if quantizeSongs then holdPerBar key else id
+-- knob position (0..1) -> value; shared with the MIDI monitor
+knobToKey :: Double -> Double
+knobToKey k = fromIntegral (round (fst keyRange + k * (snd keyRange - fst keyRange)) :: Int)
+knobToMode :: Double -> String
+knobToMode k = modes !! toIdx (length modes) k
+knobToBpm :: Double -> Double
+knobToBpm k = snapTo bpmStep (fst bpmRange + k * (snd bpmRange - fst bpmRange))
+-- filter knob -> SuperDirt djf (0.13..0.5 = 100 Hz..10 kHz low pass)
+knobToDjf :: Double -> Double
+knobToDjf k = 0.13 + k * 0.37
+
 keyPat :: Pattern Double
-keyPat = toKey <$> latchIf (knob ccKey (rangePos keyRange defKey))
+keyPat = knobToKey <$> latchIf (knob ccKey (rangePos keyRange defKey))
   where
     latchIf = if quantizeKey then holdPerBar "key" else id
-    toKey k = fromIntegral (round (fst keyRange + k * (snd keyRange - fst keyRange)) :: Int)
 modePat :: Pattern String
-modePat = (\k -> modes !! toIdx (length modes) k) <$> latchIf (knob ccMode (idxPos (length modes) defIdx))
+modePat = knobToMode <$> latchIf (knob ccMode (idxPos (length modes) defIdx))
   where
     latchIf = if quantizeMode then holdPerBar "mode" else id
     defIdx = fromMaybe 0 (lookup defMode (zip modes [0 ..]))
 bpmPat :: Pattern Double
-bpmPat = (\k -> snapTo bpmStep (fst bpmRange + k * (snd bpmRange - fst bpmRange))) <$> knob ccBpm (rangePos bpmRange defBpm)
+bpmPat = knobToBpm <$> knob ccBpm (rangePos bpmRange defBpm)
 
 -- ---- timeline and selection ------------------------------------------------
 -- pickP keeps absolute time (innerJoin), so a newly chosen song enters in
@@ -2510,8 +2578,9 @@ addTails = withEvent extend
 
 -- ---- tracks and mix --------------------------------------------------------
 buildTrack :: Int -> (String, Song -> Track, Bool) -> ControlPattern
-buildTrack orb (name, getT, melodic) = finalize pitched # orbit (pure orb)
+buildTrack orb (name, getT, melodic) = cutIf (finalize pitched # orbit (pure orb))
   where
+    cutIf = if name `elem` cutTracks then (# cut 1) else id
     patSel = songKnob (name ++ ".pattern") (lookupCfg name ccPattern) (lookupCfg name defPattern)
     timSel = songKnob (name ++ ".timbre") (lookupCfg name ccTimbre) (lookupCfg name defTimbre)
     patP = pickP patSel [bySection (pats (getT sg)) | sg <- songs]
@@ -2526,11 +2595,59 @@ mixMatrix = addTails (stack (zipWith buildTrack [0 ..] trackDefs) # cps ((/ 240)
 -- =====================================================================
 --  4. OUTPUT
 -- =====================================================================
--- DDJ-FLX6 filter knob (MIDI channel 7, CC 25) as a low pass on the whole mix:
--- 100 Hz - 10 kHz, open until the knob is moved. Uses SuperDirt's djf so the
--- tracks' own lpf settings are kept (djf 0-0.5 is its low pass half).
-d1 $ mixMatrix # djf (range 0.13 0.5 $ cF 1 "ch7cc25")
+-- Filter knob (ccFilter) as a low pass on the whole mix: 100 Hz - 10 kHz,
+-- open until the knob is moved. Uses SuperDirt's djf so the tracks' own lpf
+-- settings are kept (djf 0-0.5 is its low pass half).
+d1 $ mixMatrix # djf (knobToDjf <$> cF 1 ccFilter)
 
--- stop:   hush
-hush
--- hi
+-- hush
+
+-- =====================================================================
+--  5. MIDI MONITOR  --  prints knob changes in the Tidal output
+-- =====================================================================
+--  A background thread checks the controller values Tidal has received
+--  ten times a second and prints a line when what a control means
+--  changes, e.g.
+--      MIDI mode (ch3cc19): dorian
+--      MIDI bpm (ch1cc0): 132.4 BPM
+--  Only controls named in CONFIG are shown, and only after they first move.
+--  Re-running this section (or :runblocks) replaces the previous monitor.
+--  Turn it off with monitorMidi = False.
+
+import Control.Concurrent (forkIO, threadDelay, modifyMVar, readMVar)
+
+import System.IO (hFlush, stdout)
+
+mmSongLabel :: Double -> String
+mmSongLabel k = "song " ++ show i ++ " (" ++ songName (songs !! i) ++ ")"
+  where i = toIdx nSongs k
+
+mmControls :: [(String, String, Double -> String)]
+mmControls =
+     [ (t ++ ".pattern", lookupCfg t ccPattern, mmSongLabel) | (t, _, _) <- trackDefs ]
+  ++ [ (t ++ ".timbre", lookupCfg t ccTimbre, mmSongLabel) | (t, _, _) <- trackDefs ]
+  ++ [ ("key", ccKey, \k -> let s = round (knobToKey k) :: Int in (if s > 0 then "+" else "") ++ show s ++ " semitones")
+     , ("mode", ccMode, knobToMode)
+     , ("bpm", ccBpm, \k -> show (fromIntegral (round (knobToBpm k * 10) :: Int) / 10 :: Double) ++ " BPM")
+     , ("filter", ccFilter, \k -> show (round (20 * 500 ** (knobToDjf k / 0.5)) :: Int) ++ " Hz low pass") ]
+
+-- Each monitor has a generation number stored in Tidal's state; a monitor
+-- stops as soon as a newer one has been started.
+mmMonitorLoop :: Int -> Map.Map String String -> IO ()
+mmMonitorLoop gen prev = do
+  threadDelay 100000
+  st <- readMVar (sStateMV tidal)
+  if Map.lookup "_mmMonitor" st /= Just (VI gen)
+    then return ()
+    else do
+      let now = Map.fromList [ (lbl ++ " (" ++ cc ++ ")", f v) | (lbl, cc, f) <- mmControls, Just v <- [Map.lookup cc st >>= numVal] ]
+          changed = [ (l, s) | (l, s) <- Map.toList now, Map.lookup l prev /= Just s ]
+      mapM_ (\(l, s) -> putStrLn ("MIDI " ++ l ++ ": " ++ s)) changed
+      if null changed then return () else hFlush stdout
+      mmMonitorLoop gen now
+
+mmMonitorGen <- modifyMVar (sStateMV tidal) (\st -> let g = case Map.lookup "_mmMonitor" st of { Just (VI i) -> i + 1; _ -> 0 } in return (Map.insert "_mmMonitor" (VI g) st, g))
+
+_ <- if monitorMidi then forkIO (mmMonitorLoop mmMonitorGen Map.empty) else forkIO (return ())
+
+putStrLn (if monitorMidi then "Mix-Matrix: MIDI monitor on" else "Mix-Matrix: MIDI monitor off")
