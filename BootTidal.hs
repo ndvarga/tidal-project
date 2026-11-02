@@ -48,5 +48,21 @@ runBlocksScript src = unlines (concatMap wrap (filter runnable (blocks (lines (f
 :}
 :def runblocks (\f -> runBlocksScript <$> readFile (if null f then "D:/Documents/School/Fall26/INAM7000/unparty/tidal-project/main.tidal" else f))
 
+-- :songs  re-evaluates the "songs <- setSongs" block of main.tidal (read from
+-- the saved file), so a song you just re-evaluated with Ctrl+Enter is heard.
+:{
+songsBlockScript :: String -> String
+songsBlockScript src = case filter hasSongs (blocks (lines (filter (/= '\r') src))) of
+    [] -> "putStrLn \"Mix-Matrix: no 'songs <- setSongs' block found in main.tidal\""
+    bs -> unlines (concat [[":{"] ++ b ++ [":}"] | b <- bs])
+  where
+    blank = null . dropWhile Data.Char.isSpace
+    blocks ls = case dropWhile blank ls of
+      [] -> []
+      xs -> let (b, rest) = break blank xs in b : blocks rest
+    hasSongs = any ((== "songs <- setSongs") . take 17)
+:}
+:def songs (\_ -> songsBlockScript <$> readFile "D:/Documents/School/Fall26/INAM7000/unparty/tidal-project/main.tidal")
+
 :set prompt "tidal> "
 :set prompt-cont ""

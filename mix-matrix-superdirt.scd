@@ -106,6 +106,11 @@
 		(SinOsc.ar(v) * 0.5) + (SinOsc.ar(v * 2) * 0.08)
 			+ (BPF.ar(WhiteNoise.ar, (f * 2).clip(100, 15000), 0.3) * (0.05 + (0.2 * t)))
 	});
+	make.(\mm_reese, { |f, t|        // reese bass: two saws ~12 cents apart beating, a centre saw, a sub
+		var saws = Mix(Saw.ar(f * [0.993, 1.007])) + (Saw.ar(f) * 0.5);
+		var sub = SinOsc.ar(f * 0.5) * 0.35;
+		(LPF.ar(saws, (f * (2 + (t * 10))).clip(60, 9000)) * 0.25) + sub
+	});
 	make.(\mm_bass, { |f, t|         // electric, fretless, slap and upright bass
 		var fe = EnvGen.ar(Env.perc(0.003, 0.3));
 		(SinOsc.ar(f) * 0.6) + (LPF.ar(Saw.ar(f), (f * (1.5 + (fe * (2 + (t * 8))))).clip(40, 12000)) * 0.35)

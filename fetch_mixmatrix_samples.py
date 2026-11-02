@@ -38,6 +38,7 @@ FRETLESS = 'https://raw.githubusercontent.com/cleary/samples-flbass/main/'
 DIRT = 'https://raw.githubusercontent.com/tidalcycles/Dirt-Samples/master/'
 AMEN160 = 'https://raw.githubusercontent.com/Durmiente/amen_breaks_160/main/'
 AMENOG = 'https://raw.githubusercontent.com/cassette-tape/amen/main/'
+HDKICKS = 'https://raw.githubusercontent.com/Tonyha7/kicks/main/'
 
 # Sounds the Strudel version mapped by hand from GitHub repos (same files, same order)
 EXPLICIT = {
@@ -70,6 +71,8 @@ EXPLICIT = {
     # the original amen break (MP3, converted to WAV when ffmpeg is installed);
     # slice_amen.py cuts it into am_slice afterwards
     'am_og':     (AMENOG, ['amen_break_og.mp3']),
+    # hardcore kick from Tonyha7/kicks (used by the "rotterdam" choruses)
+    'hc_kick':   (HDKICKS, ['Hardcore/Untitled project - 2024-Feb-03_9.wav']),
 }
 
 # Every sample folder the songs use that SuperDirt's own Dirt-Samples lacks
@@ -152,6 +155,7 @@ NEEDED = [
     "gong",
     "gong2",
     "guiro",
+    "hc_kick",
     "hp_bass",
     "hp_bubble",
     "hp_coin",
