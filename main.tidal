@@ -192,7 +192,7 @@ ccPattern, ccTimbre :: [(String, String)]
 ccPattern = [("kick", "ch3cc4"), ("snare", "ch1cc4"), ("hat", "ch2cc4"), ("perc", "ch4cc4"), ("lead", "ch3cc7"), ("chords", "ch1cc7"), ("bass", "ch2cc7")]
 ccTimbre = [("kick", "ch3cc11"), ("snare", "ch1cc11"), ("hat", "ch2cc11"), ("perc", "ch4cc11"), ("lead", "ch3cc15"), ("chords", "ch1cc15"), ("bass", "ch2cc15")]
 ccKey, ccMode, ccBpm, ccFilter :: String
-ccKey = "ch1cc34"
+ccKey = "ch7cc23"  -- tonic: shifts rootNote up to 6 semitones either way
 ccMode = "ch3cc19"
 ccBpm = "ch1cc0"
 ccFilter = "ch7cc25"
@@ -1066,7 +1066,7 @@ rotterdam <- defSong Song
       [ silence  -- intro
       , velocity "~ 1 ~ 1"  -- chorus
       , velocity "<~ [~ ~ ~ 1] ~ [~ ~ ~ 1]>"  -- breakdown
-      , velocity "<[~ 1 ~ 1]!4 [~ 1 1 1]!2 [1*8] [1*16]>"  -- buildup
+      , velocity "<[~ 1 ~ 1]!4 [1 1 1 1]!2 [1*8] [1*16]>"  -- buildup
       , velocity "<[~ 1 ~ 1]!3 [~ 1 [1 1] [1 1 1 1]]>"  -- chorus2
       ]
       [ s "RolandTR909_cp" # lvl 0.7  -- intro
@@ -2069,11 +2069,11 @@ chamber <- defSong Song
       , velocity "1 1 1 ~ 1 1 ~ 1 ~ 1 1 ~"  -- buildup
       , velocity "1 1 ~ 1 1 ~ 1 ~ 1 1 ~ 1"  -- chorus2
       ]
-      [ s "clap" # lvl 0.5  -- intro
-      , s "clap" # verb 0.3 # lvl 0.5  -- chorus
+      [ s "clap" # lvl 0.3  -- intro
+      , s "clap" # verb 0.3 # lvl 0.4 -- chorus
       , s "woodblock" # verb 0.6 # lvl 0.45  -- breakdown
-      , s "woodblock:2" # lvl 0.5  -- buildup
-      , s "clap:3" # verb 0.3 # lvl 0.5  -- chorus2
+      , s "woodblock:2" # lvl 0.4 -- buildup
+      , s "clap:3" # verb 0.3 # lvl 0.4  -- chorus2
       ]
   , leadT = Track
       [ n ("[0 2 4 7 4 2]*2" |+ puRoots) # velocity "0.7 0.5 0.5 0.6 0.5 0.5"  -- intro
@@ -2097,7 +2097,7 @@ chamber <- defSong Song
       ]
       [ s "mm_pluck" # mtone 0.2 # mrel 0.3 # lvl 0.6  -- intro
       , s "mm_pluck" # mtone 0.2 # mrel 0.3 # verb 0.3 # lvl 0.6  -- chorus
-      , s "superpiano" # verb 0.6 # lvl 0.55  -- breakdown
+      , s "superpiano" # verb 0.6 # lvl 0.5  -- breakdown
       , s "mm_mallet" # mtone 0.15 # mrel 0.3 # lvl 0.6  -- buildup
       , s "mm_pluck" # mtone 0.2 # mrel 0.3 # verb 0.35 # lvl 0.6  -- chorus2
       ]
@@ -2716,7 +2716,7 @@ mmControls :: [(String, String, Double -> String)]
 mmControls =
      [ (t ++ ".pattern", lookupCfg t ccPattern, mmSongLabel) | (t, _, _) <- trackDefs ]
   ++ [ (t ++ ".timbre", lookupCfg t ccTimbre, mmSongLabel) | (t, _, _) <- trackDefs ]
-  ++ [ ("key", ccKey, \k -> let s = round (knobToKey k) :: Int in (if s > 0 then "+" else "") ++ show s ++ " semitones")
+  ++ [ ("key", ccKey, \k -> let s = round (knobToKey k) :: Int in "tonic " ++ (["C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"] !! ((pitchClass rootNote + s) `mod` 12)) ++ " (" ++ (if s > 0 then "+" else "") ++ show s ++ " semitones)")
      , ("mode", ccMode, knobToMode)
      , ("bpm", ccBpm, \k -> show (fromIntegral (round (knobToBpm k * 10) :: Int) / 10 :: Double) ++ " BPM")
      , ("filter", ccFilter, \k -> show (round (20 * 500 ** (knobToDjf k / 0.5)) :: Int) ++ " Hz low pass") ]
